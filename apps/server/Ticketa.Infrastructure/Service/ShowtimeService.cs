@@ -17,7 +17,7 @@ namespace Ticketa.Infrastructure.Service
     private readonly IUnitOfWork _uow = uow;
     private readonly TimeConversions _timeConversions = timeConversions;
 
-    // ── DataTables ───────────────────────────────────────────────
+    // ── DataTables ────────────────────────────────────────────────
 
     public async Task<IEnumerable<MovieShowtimeDto>> GetAllAsync(
         string? search,
@@ -45,33 +45,38 @@ namespace Ticketa.Infrastructure.Service
           new ShowtimeSpecification(status, query, archivedOnly: archivedOnly));
 
       return showtimes
-          .GroupBy(s => s.Movie)
-          .Select(g => new MovieShowtimeDto
+          .GroupBy(s => s.MovieId)
+          .Select(g =>
           {
-            MovieId = g.Key.Id,
-            TmdbId = g.Key.TmdbId,
-            Title = g.Key.Title,
-            PosterPath = g.Key.PosterPath,
-            trailerKey = g.Key.TrailerKey,
-            Rate = g.Key.VoteAverage,
-            Runtime = g.Key.RuntimeMinutes,
-            Genres = g.Key.Genres.Select(genre => genre.Name).ToList(),
-            Showtimes = g.Select(s => new ShowtimeListItemDto
+            var movie = g.First().Movie;
+            return new MovieShowtimeDto
             {
-              Id = s.Id,
-              HallName = s.Hall.Name,
-              VisibleSeatCount = HallTypeHelper.GetTemplate(s.Hall.Type).VisibleSeatCount,
-              StartTime = _timeConversions.EnsureUtcKind(s.StartTime),
-              EndTime = _timeConversions.EnsureUtcKind(s.EndTime),
-              Price = s.Price,
-              Status = s.Status,
-              HallId = s.HallId,
-              IsArchived = s.IsArchived,
-              ArchivedAt = s.ArchivedAt.HasValue ? _timeConversions.EnsureUtcKind(s.ArchivedAt.Value) : null
-            }).OrderBy(s => s.StartTime).ToList()
+              MovieId = movie.Id,
+              TmdbId = movie.TmdbId,
+              Title = movie.Title,
+              PosterPath = movie.PosterPath,
+              trailerKey = movie.TrailerKey,
+              Rate = movie.VoteAverage,
+              Runtime = movie.RuntimeMinutes,
+              Genres = movie.Genres.Select(genre => genre.Name).ToList(),
+              Showtimes = g.Select(s => new ShowtimeListItemDto
+              {
+                Id = s.Id,
+                HallName = s.Hall.Name,
+                VisibleSeatCount = HallTypeHelper.GetTemplate(s.Hall.Type).VisibleSeatCount,
+                StartTime = _timeConversions.EnsureUtcKind(s.StartTime),
+                EndTime = _timeConversions.EnsureUtcKind(s.EndTime),
+                Price = s.Price,
+                Status = s.Status,
+                HallId = s.HallId,
+                IsArchived = s.IsArchived,
+                ArchivedAt = s.ArchivedAt.HasValue ? _timeConversions.EnsureUtcKind(s.ArchivedAt.Value) : null
+              }).OrderBy(s => s.StartTime).ToList()
+            };
           })
           .OrderBy(m => m.Title);
     }
+
     public async Task<object> GetAllAsync(DataTableRequestsDto request, string? search, string? segmentedFilter)
     {
       return await GetAllDataTableAsync(request, search, segmentedFilter);
@@ -87,32 +92,48 @@ namespace Ticketa.Infrastructure.Service
         _ => null
       };
 
-      var searchValue = string.IsNullOrWhiteSpace(search) ? null : search;
+      var searchValue = string.IsNullOrWhiteSpace(search) ? null : search.Trim();
+      var hasFilter = status.HasValue || !string.IsNullOrEmpty(searchValue);
 
-      // ── 1. Run count + filtered-ID fetch in parallel ──────────
-      var totalTask = context.Showtimes
-          .Where(s => !s.IsArchived)
-          .Select(s => s.MovieId)
-          .Distinct()
-          .CountAsync();
+      // ── 1. Count queries with AsNoTracking ────────────────────────
+      var baseQuery = context.Showtimes
+          .AsNoTracking()
+          .Where(s => !s.IsArchived);
 
-      IQueryable<Showtime> filteredQuery = context.Showtimes.Where(s => !s.IsArchived);
+      IQueryable<Showtime> filteredQuery = baseQuery;
 
       if (status.HasValue)
         filteredQuery = filteredQuery.Where(s => s.Status == status.Value);
 
       if (!string.IsNullOrEmpty(searchValue))
+      {
         filteredQuery = filteredQuery.Where(s =>
             s.Movie.Title.Contains(searchValue) || s.Hall.Name.Contains(searchValue));
+      }
 
-      // Materialize the distinct movie IDs once — reused for count + paging
-      var filteredMovieIds = await filteredQuery
-          .Select(s => s.MovieId)
-          .Distinct()
-          .ToListAsync();
+      int totalMovies;
+      int filteredCount;
 
-      var totalMovies = await totalTask;
-      var filteredCount = filteredMovieIds.Count;
+      if (!hasFilter)
+      {
+        totalMovies = await baseQuery
+            .Select(s => s.MovieId)
+            .Distinct()
+            .CountAsync();
+        filteredCount = totalMovies;
+      }
+      else
+      {
+        filteredCount = await filteredQuery
+            .Select(s => s.MovieId)
+            .Distinct()
+            .CountAsync();
+
+        totalMovies = await baseQuery
+            .Select(s => s.MovieId)
+            .Distinct()
+            .CountAsync();
+      }
 
       if (filteredCount == 0)
       {
@@ -125,47 +146,65 @@ namespace Ticketa.Infrastructure.Service
         };
       }
 
-      // ── 2. Slice the in-memory list for paging ────────────────
-      var pagedMovieIds = filteredMovieIds
-          .OrderBy(id => id)  // stable sort; title ordering applied below
+      // ── 2. Database-level alphabetical paging for distinct movie IDs ──────────
+      var pagedMovieIds = await filteredQuery
+          .Select(s => new { s.MovieId, s.Movie.Title })
+          .Distinct()
+          .OrderBy(x => x.Title)
           .Skip(request.Start)
           .Take(request.Length)
-          .ToList();
+          .Select(x => x.MovieId)
+          .ToListAsync();
 
-      // ── 3. Load showtimes only for paged movies (with includes) ─
-      var showtimes = await context.Showtimes
+      // ── 3. Load ONLY filtered showtimes for the paged movies ───────
+      var showtimesQuery = context.Showtimes
+          .AsNoTracking()
           .Include(s => s.Movie)
               .ThenInclude(m => m.Genres)
           .Include(s => s.Hall)
-          .Where(s => pagedMovieIds.Contains(s.MovieId))
-          .ToListAsync();
+          .Where(s => !s.IsArchived && pagedMovieIds.Contains(s.MovieId));
 
-      // ── 4. Group by movie in C# (small paged set) ─────────────
+      if (status.HasValue)
+        showtimesQuery = showtimesQuery.Where(s => s.Status == status.Value);
+
+      if (!string.IsNullOrEmpty(searchValue))
+      {
+        showtimesQuery = showtimesQuery.Where(s =>
+            s.Movie.Title.Contains(searchValue) || s.Hall.Name.Contains(searchValue));
+      }
+
+      var showtimes = await showtimesQuery.ToListAsync();
+
+      // ── 4. Group by MovieId in C# (small paged set) ───────────────
       var movieGroups = showtimes
-          .GroupBy(s => s.Movie)
-          .Select(g => new MovieShowtimeDto
+          .GroupBy(s => s.MovieId)
+          .Select(g =>
           {
-            MovieId = g.Key.Id,
-            TmdbId = g.Key.TmdbId,
-            Title = g.Key.Title,
-            PosterPath = g.Key.PosterPath,
-            trailerKey = g.Key.TrailerKey,
-            Rate = g.Key.VoteAverage,
-            Runtime = g.Key.RuntimeMinutes,
-            Genres = g.Key.Genres.Select(genre => genre.Name).ToList(),
-            Showtimes = g.Select(s => new ShowtimeListItemDto
+            var movie = g.First().Movie;
+            return new MovieShowtimeDto
             {
-              Id = s.Id,
-              HallName = s.Hall.Name,
-              VisibleSeatCount = HallTypeHelper.GetTemplate(s.Hall.Type).VisibleSeatCount,
-              StartTime = _timeConversions.EnsureUtcKind(s.StartTime),
-              EndTime = _timeConversions.EnsureUtcKind(s.EndTime),
-              Price = s.Price,
-              Status = s.Status,
-              HallId = s.HallId,
-              IsArchived = s.IsArchived,
-              ArchivedAt = s.ArchivedAt.HasValue ? _timeConversions.EnsureUtcKind(s.ArchivedAt.Value) : null
-            }).OrderBy(s => s.StartTime).ToList()
+              MovieId = movie.Id,
+              TmdbId = movie.TmdbId,
+              Title = movie.Title,
+              PosterPath = movie.PosterPath,
+              trailerKey = movie.TrailerKey,
+              Rate = movie.VoteAverage,
+              Runtime = movie.RuntimeMinutes,
+              Genres = movie.Genres.Select(genre => genre.Name).ToList(),
+              Showtimes = g.Select(s => new ShowtimeListItemDto
+              {
+                Id = s.Id,
+                HallName = s.Hall.Name,
+                VisibleSeatCount = HallTypeHelper.GetTemplate(s.Hall.Type).VisibleSeatCount,
+                StartTime = _timeConversions.EnsureUtcKind(s.StartTime),
+                EndTime = _timeConversions.EnsureUtcKind(s.EndTime),
+                Price = s.Price,
+                Status = s.Status,
+                HallId = s.HallId,
+                IsArchived = s.IsArchived,
+                ArchivedAt = s.ArchivedAt.HasValue ? _timeConversions.EnsureUtcKind(s.ArchivedAt.Value) : null
+              }).OrderBy(s => s.StartTime).ToList()
+            };
           })
           .OrderBy(m => m.Title)
           .ToList();
@@ -179,7 +218,7 @@ namespace Ticketa.Infrastructure.Service
       };
     }
 
-    // ── Create & Update ───────────────────────────────────────────────────
+    // ── Create & Update ───────────────────────────────────────────
 
     public async Task<string?> CreateAsync(ShowtimeUpsertDto dto)
     {
@@ -279,7 +318,7 @@ namespace Ticketa.Infrastructure.Service
       return null;
     }
 
-    // ── Halls dropdown ───────────────────────────────────────────
+    // ── Halls dropdown ────────────────────────────────────────────
 
     public async Task<IEnumerable<HallDto>> GetHallsAsync()
     {
@@ -368,6 +407,7 @@ namespace Ticketa.Infrastructure.Service
       var showtimeIds = showtimes.Select(s => s.Id).ToList();
       var bookingShowtimeIds = showtimeIds.Count > 0
           ? await context.BookedSeats
+              .AsNoTracking()
               .Where(bs => showtimeIds.Contains(bs.ShowtimeId))
               .Select(bs => bs.ShowtimeId)
               .Distinct()

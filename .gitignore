@@ -379,3 +379,11 @@ firebase-key.json
 *firebase-key*.json
 
 
+/apps/server/.idea/.idea.TicketaSol/.idea/.gitignore
+/apps/server/.idea/.idea.TicketaSol/.idea/.name
+/apps/server/.idea/.idea.TicketaSol/.idea/dataSources.xml
+/apps/server/.idea/.idea.TicketaSol/.idea/db-forest-config.xml
+/apps/server/.idea/.idea.TicketaSol/.idea/encodings.xml
+/apps/server/.idea/.idea.TicketaSol/.idea/indexLayout.xml
+/apps/server/.idea/.idea.TicketaSol/.idea/jsonSchemas.xml
+/apps/server/.idea/.idea.TicketaSol/.idea/vcs.xml

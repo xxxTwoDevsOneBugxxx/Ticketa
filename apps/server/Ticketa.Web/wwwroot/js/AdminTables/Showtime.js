@@ -2,6 +2,7 @@ import { initDataTable } from "../DataTables.js";
 
 const imageBase = "https://image.tmdb.org/t/p/w200";
 const trailerKeyCache = new Map();
+const pageCache = new Map();
 
 function toDataTableDate(value) {
     if (!value) return "";
@@ -13,6 +14,55 @@ function toDataTableDate(value) {
         hour: '2-digit', minute: '2-digit'
     };
     return date.toLocaleDateString(undefined, options);
+}
+
+function renderMovieSkeletons(count = 5) {
+    let html = '';
+    for (let i = 0; i < count; i++) {
+        html += `
+            <tr class="animate-pulse">
+                <td class="p-0 border-0 bg-transparent align-top">
+                    <div class="border border-base-300 bg-base-100 rounded-xl overflow-hidden shadow-sm mb-4">
+                        <div class="flex items-center gap-4 p-4">
+                            <div class="w-12 h-16 bg-base-300 rounded shrink-0"></div>
+                            <div class="flex-1 space-y-2.5 min-w-0">
+                                <div class="h-5 w-48 bg-base-300 rounded"></div>
+                                <div class="h-3.5 w-28 bg-base-300 rounded"></div>
+                            </div>
+                            <div class="h-7 w-28 rounded-full bg-base-300 shrink-0"></div>
+                            <div class="w-5 h-5 rounded bg-base-300 shrink-0"></div>
+                        </div>
+                    </div>
+                </td>
+            </tr>
+        `;
+    }
+    return html;
+}
+
+function schedulePrefetch(currentStart, length, totalRecords, filter, searchVal) {
+    const nextStart = currentStart + length;
+    if (nextStart < totalRecords) {
+        const nextKey = `${filter}_${searchVal}_${nextStart}_${length}`;
+        if (!pageCache.has(nextKey)) {
+            const params = new URLSearchParams({
+                draw: '0',
+                start: nextStart.toString(),
+                length: length.toString(),
+                'search[value]': searchVal,
+                segmentedFilter: filter
+            });
+
+            fetch(`/Showtime/GetAll?${params.toString()}`)
+                .then(res => res.ok ? res.json() : null)
+                .then(data => {
+                    if (data && data.data) {
+                        pageCache.set(nextKey, data);
+                    }
+                })
+                .catch(() => {});
+        }
+    }
 }
 
 function getTrailerModalElements() {
@@ -269,8 +319,27 @@ observeModalForTomSelect();
 
 let currentUrl = "/Showtime/GetAll";
 
+// Optimistic pagination feedback listener
+document.addEventListener("click", (e) => {
+    const btn = e.target.closest(".dt-paging button");
+    if (!btn || btn.disabled) return;
+
+    const container = btn.closest(".dt-paging");
+    if (!container) return;
+
+    // Instantly highlight clicked button
+    const allBtns = container.querySelectorAll("button");
+    allBtns.forEach(b => {
+        b.classList.remove("current", "is-active");
+        b.removeAttribute("aria-current");
+    });
+    btn.classList.add("current", "is-active");
+    btn.setAttribute("aria-current", "page");
+});
+
 if (dataTableElement) {
     let currentFilter = "all";
+
     initDataTable(currentUrl, [
         {
             data: null,
@@ -280,7 +349,7 @@ if (dataTableElement) {
             render: function (data, type, row) {
                 if (type === 'display') {
                     const poster = row.posterPath ? `<img src="${imageBase}${row.posterPath}" alt="Poster" class="w-12 h-16 object-cover rounded shadow-sm shrink-0" />` : `<div class="w-12 h-16 bg-base-300 rounded flex items-center justify-center text-[10px] text-base-content/50 shrink-0 border border-base-300">
-                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="opacity-30"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="opacity-30"><rect width="18" height="18" x="3" y="3" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
                     </div>`;
 
                     let showtimesHtml = '';
@@ -412,14 +481,58 @@ if (dataTableElement) {
     ], {
         ordering: false,
         bSort: false,
-        ajaxData: function () {
-            return { segmentedFilter: currentFilter };
+        ajax: function (data, callback, settings) {
+            const searchVal = data.search?.value?.trim() ?? "";
+            const cacheKey = `${currentFilter}_${searchVal}_${data.start}_${data.length}`;
+
+            if (pageCache.has(cacheKey)) {
+                const cached = pageCache.get(cacheKey);
+                cached.draw = data.draw;
+                callback(cached);
+                schedulePrefetch(data.start, data.length, cached.recordsFiltered, currentFilter, searchVal);
+                return;
+            }
+
+            // Show 5 skeleton rows in table while loading
+            const tbody = document.querySelector("#DataTable tbody");
+            if (tbody) {
+                tbody.innerHTML = renderMovieSkeletons(5);
+            }
+
+            const params = new URLSearchParams({
+                draw: data.draw.toString(),
+                start: data.start.toString(),
+                length: data.length.toString(),
+                'search[value]': searchVal,
+                segmentedFilter: currentFilter
+            });
+
+            fetch(`${currentUrl}?${params.toString()}`)
+                .then(res => {
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    return res.json();
+                })
+                .then(result => {
+                    pageCache.set(cacheKey, result);
+                    callback(result);
+                    schedulePrefetch(data.start, data.length, result.recordsFiltered, currentFilter, searchVal);
+                })
+                .catch(err => {
+                    console.error("Failed to load showtimes:", err);
+                    callback({
+                        draw: data.draw,
+                        recordsTotal: 0,
+                        recordsFiltered: 0,
+                        data: []
+                    });
+                });
         },
         initComplete: function () {
             const api = this.api();
 
             initSegmentedFilter((filter) => {
                 currentFilter = filter;
+                pageCache.clear();
                 api.ajax.reload();
             });
         },
@@ -432,4 +545,3 @@ if (dataTableElement) {
         }
     });
 }
-
