@@ -723,7 +723,7 @@ Why was the final approach selected?
 ### P0 — Correctness
 
 * [x] Booking concurrency integration test
-* [ ] Verify unique booked-seat constraint
+* [x] Verify unique booked-seat constraint
 * [ ] Verify transaction behavior
 * [ ] Verify payment retry/idempotency semantics
 
