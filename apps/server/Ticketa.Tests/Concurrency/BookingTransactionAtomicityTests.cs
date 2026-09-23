@@ -1,17 +1,7 @@
 ﻿using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using Ticketa.Core.DTOs;
 using Ticketa.Core.Entities;
 using Ticketa.Core.Enums;
-using Ticketa.Core.Helpers;
-using Ticketa.Core.Interfaces;
-using Ticketa.Core.Interfaces.IRepositories;
-using Ticketa.Core.Interfaces.IServices;
 using Ticketa.Infrastructure.Data;
-using Ticketa.Infrastructure.Repositories;
-using Ticketa.Infrastructure.Service;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -35,28 +25,40 @@ namespace Ticketa.Tests.Concurrency
             Console.WriteLine(message);
         }
 
-        [Fact]
-        public async Task Booking_WithOneTakenSeatAndOneAvailableSeat_FailsAndDoesNotInsertAvailableSeat()
+        private ApplicationDbContext CreateDbContext()
         {
-            // 1. Arrange: Setup Service Provider and Seed DB
-            var serviceProvider = BuildServiceProvider(_fixture.ConnectionString);
+            var options = new DbContextOptionsBuilder<ApplicationDbContext>()
+                .UseSqlServer(_fixture.ConnectionString)
+                .Options;
+
+            return new ApplicationDbContext(options);
+        }
+
+        private static string GenerateBookingReference() =>
+            $"TKT-{DateTime.UtcNow:yyyyMMdd}-{Random.Shared.Next(1000, 9999)}";
+
+        [Fact]
+        public async Task MultiSeatBooking_WhenOneSeatViolatesDatabaseUniqueConstraint_RollsBackEntireOperationAtDatabaseLevel()
+        {
+            // =========================================================================
+            // 1. Initial State / Setup: 1 Hall, 1 Movie, 1 Showtime, 2 Users
+            // =========================================================================
             int showtimeId;
             var userAId = $"user-a-{Guid.NewGuid():N}";
             var userBId = $"user-b-{Guid.NewGuid():N}";
 
-            var contestedSeat = new SeatDto { Row = 2, SeatNumber = 1 };
-            var availableSeat = new SeatDto { Row = 2, SeatNumber = 2 };
+            const int rowA = 1;
+            const int seatNumberA1 = 1; // A1
+            const int seatNumberA2 = 2; // A2
 
-            using (var scope = serviceProvider.CreateScope())
+            await using (var db = CreateDbContext())
             {
-                var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-
                 var hall = new Hall
                 {
                     Name = $"Atomicity-Hall-{Guid.NewGuid():N}",
                     Type = HallType.Standard,
-                    TotalRows = 12,
-                    SeatsPerRow = 16
+                    TotalRows = 10,
+                    SeatsPerRow = 10
                 };
                 db.Halls.Add(hall);
 
@@ -76,242 +78,174 @@ namespace Ticketa.Tests.Concurrency
                     MovieId = movie.Id,
                     StartTime = DateTime.UtcNow.AddDays(1),
                     EndTime = DateTime.UtcNow.AddDays(1).AddHours(2),
-                    Price = 120m,
+                    Price = 100m,
                     Status = ShowtimeStatus.Scheduled
                 };
                 db.Showtimes.Add(showtime);
 
                 db.Users.AddRange(
-                    new AppUser { Id = userAId, UserName = $"usera_{Guid.NewGuid():N}@test.com", Email = $"usera_{Guid.NewGuid():N}@test.com", FirstName = "User", LastName = "A" },
-                    new AppUser { Id = userBId, UserName = $"userb_{Guid.NewGuid():N}@test.com", Email = $"userb_{Guid.NewGuid():N}@test.com", FirstName = "User", LastName = "B" }
+                    new AppUser
+                    {
+                        Id = userAId,
+                        UserName = $"usera_{Guid.NewGuid():N}@test.com",
+                        Email = $"usera_{Guid.NewGuid():N}@test.com",
+                        FirstName = "User",
+                        LastName = "A"
+                    },
+                    new AppUser
+                    {
+                        Id = userBId,
+                        UserName = $"userb_{Guid.NewGuid():N}@test.com",
+                        Email = $"userb_{Guid.NewGuid():N}@test.com",
+                        FirstName = "User",
+                        LastName = "B"
+                    }
                 );
 
                 await db.SaveChangesAsync();
                 showtimeId = showtime.Id;
             }
 
-            // 2. Act 1: User A successfully books the contested seat
-            using (var scope = serviceProvider.CreateScope())
+            // =========================================================================
+            // 2. Step 1: Create an existing booking (User A books Seat A1)
+            // =========================================================================
+            var bookingRefA = GenerateBookingReference();
+            await using (var db = CreateDbContext())
             {
-                var bookingService = scope.ServiceProvider.GetRequiredService<IBookingService>();
-                var resultA = await bookingService.CreateAsync(new BookingCreateDto
+                var bookingA = new Booking
                 {
+                    UserId = userAId,
                     ShowtimeId = showtimeId,
-                    Seats = new List<SeatDto> { contestedSeat }
-                }, userAId);
+                    BookedAt = DateTime.UtcNow,
+                    TotalAmount = 100m,
+                    Status = BookingStatus.Confirmed,
+                    BookingRefrence = bookingRefA,
+                    BookedSeats = new List<BookedSeat>
+                    {
+                        new BookedSeat
+                        {
+                            ShowtimeId = showtimeId,
+                            Row = rowA,
+                            SeatNumber = seatNumberA1,
+                            Category = SeatCategory.Regular,
+                            Price = 100m
+                        }
+                    }
+                };
 
-                Assert.True(resultA.Succeeded, "Initial booking by User A should succeed.");
-                LogMessage($"[User A] Successfully booked Seat R{contestedSeat.Row}S{contestedSeat.SeatNumber} with Ref: {resultA.BookingReference}");
+                db.Bookings.Add(bookingA);
+                await db.SaveChangesAsync();
+
+                LogMessage($"[Step 1] User A successfully booked Seat R{rowA}S{seatNumberA1} (A1).");
             }
 
-            // 3. Act 2: User B attempts to book [contestedSeat, availableSeat] in a single transaction
-            BookingResultDto resultB;
-            using (var scope = serviceProvider.CreateScope())
+            // =========================================================================
+            // 3. Step 2: Attempt an invalid multi-seat booking via fresh ApplicationDbContext
+            //    Directly through DbContext (NOT BookingService) so the database unique constraint is tested!
+            //    Changes include:
+            //    - Booking B
+            //      ├── BookedSeat A1 (duplicate -> violates unique index)
+            //      └── BookedSeat A2 (valid/free)
+            //    - Showtime state change (Status = SoldOut) in the same change set
+            // =========================================================================
+            var bookingRefB = GenerateBookingReference();
+
+            await using (var db = CreateDbContext())
             {
-                var bookingService = scope.ServiceProvider.GetRequiredService<IBookingService>();
-                resultB = await bookingService.CreateAsync(new BookingCreateDto
+                // Attach and modify showtime status to simulate capacity state update in same transaction
+                var showtime = await db.Showtimes.FirstAsync(s => s.Id == showtimeId);
+                showtime.Status = ShowtimeStatus.SoldOut;
+
+                var bookingB = new Booking
                 {
+                    UserId = userBId,
                     ShowtimeId = showtimeId,
-                    Seats = new List<SeatDto> { contestedSeat, availableSeat }
-                }, userBId);
+                    BookedAt = DateTime.UtcNow,
+                    TotalAmount = 200m,
+                    Status = BookingStatus.Confirmed,
+                    BookingRefrence = bookingRefB,
+                    BookedSeats = new List<BookedSeat>
+                    {
+                        new BookedSeat // A1: Duplicate (violates unique constraint)
+                        {
+                            ShowtimeId = showtimeId,
+                            Row = rowA,
+                            SeatNumber = seatNumberA1,
+                            Category = SeatCategory.Regular,
+                            Price = 100m
+                        },
+                        new BookedSeat // A2: Valid / available
+                        {
+                            ShowtimeId = showtimeId,
+                            Row = rowA,
+                            SeatNumber = seatNumberA2,
+                            Category = SeatCategory.Regular,
+                            Price = 100m
+                        }
+                    }
+                };
+
+                db.Bookings.Add(bookingB);
+
+                LogMessage("[Step 2] Attempting db.SaveChangesAsync() with duplicate A1 + available A2 + Showtime status change...");
+
+                // Assert that the database unique constraint throws DbUpdateException
+                var exception = await Assert.ThrowsAsync<DbUpdateException>(async () =>
+                {
+                    await db.SaveChangesAsync();
+                });
+
+                LogMessage($"[Step 2]  DbUpdateException thrown as expected: {exception.Message}");
             }
 
-            LogMessage($"[User B] Booking attempt result: Succeeded={resultB.Succeeded}");
-
-            // 4. Assert: Result checks for User B
-            Assert.False(resultB.Succeeded, "User B booking must fail due to contested seat.");
-            Assert.NotNull(resultB.ConflictingSeats);
-            Assert.Contains(resultB.ConflictingSeats, s => s.Row == contestedSeat.Row && s.SeatNumber == contestedSeat.SeatNumber);
-
-            // 5. Assert: Atomicity & Database Integrity
-            using (var scope = serviceProvider.CreateScope())
+            // =========================================================================
+            // 4. Critical Verification: Use a FRESH ApplicationDbContext
+            // =========================================================================
+            await using (var db = CreateDbContext())
             {
-                var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-
-                // A. Only User A's booking exists
+                // Assertion 1: Original booking for A1 still exists
                 var totalBookings = await db.Bookings.CountAsync(b => b.ShowtimeId == showtimeId);
                 Assert.Equal(1, totalBookings);
 
-                var userBBookingExists = await db.Bookings.AnyAsync(b => b.UserId == userBId);
-                Assert.False(userBBookingExists, "User B should not have any persisted booking record.");
+                var bookingA = await db.Bookings
+                    .Include(b => b.BookedSeats)
+                    .FirstOrDefaultAsync(b => b.UserId == userAId && b.ShowtimeId == showtimeId);
 
-                // B. Only contestedSeat is booked; availableSeat was rolled back / not inserted
-                var allBookedSeats = await db.BookedSeats
-                    .Where(s => s.ShowtimeId == showtimeId)
-                    .ToListAsync();
+                Assert.NotNull(bookingA);
+                Assert.Equal(bookingRefA, bookingA.BookingRefrence);
+                Assert.Single(bookingA.BookedSeats);
+                Assert.Equal(rowA, bookingA.BookedSeats.First().Row);
+                Assert.Equal(seatNumberA1, bookingA.BookedSeats.First().SeatNumber);
 
-                Assert.Single(allBookedSeats);
-                Assert.Equal(contestedSeat.Row, allBookedSeats[0].Row);
-                Assert.Equal(contestedSeat.SeatNumber, allBookedSeats[0].SeatNumber);
+                // Assertion 2: The valid seat A2 from the failed transaction must NOT exist
+                var isA2Inserted = await db.BookedSeats.AnyAsync(s =>
+                    s.ShowtimeId == showtimeId && s.Row == rowA && s.SeatNumber == seatNumberA2);
+                Assert.False(isA2Inserted, "CRITICAL: Seat A2 was valid/available but must NOT be persisted when the transaction rolls back.");
 
-                var availableSeatExists = await db.BookedSeats.AnyAsync(s =>
-                    s.ShowtimeId == showtimeId && s.Row == availableSeat.Row && s.SeatNumber == availableSeat.SeatNumber);
-                Assert.False(availableSeatExists, "The available seat must NOT be inserted into the database when the transaction fails.");
+                // Assertion 3: User B's booking must NOT exist
+                var isBookingBPersisted = await db.Bookings.AnyAsync(b => b.UserId == userBId);
+                Assert.False(isBookingBPersisted, "CRITICAL: User B's booking must NOT be persisted in the database.");
 
-                LogMessage(" Atomicity verification passed: No partial seat or booking records saved.");
+                // Assertion 4: Only 1 seat in total is booked in the database (Seat A1)
+                var totalBookedSeats = await db.BookedSeats.CountAsync(s => s.ShowtimeId == showtimeId);
+                Assert.Equal(1, totalBookedSeats);
+
+                // Assertion 5: Related state change (Showtime.Status) must also be rolled back to Scheduled
+                var showtime = await db.Showtimes.FindAsync(showtimeId);
+                Assert.NotNull(showtime);
+                Assert.Equal(ShowtimeStatus.Scheduled, showtime.Status);
+
+                LogMessage("================================================================================");
+                LogMessage("       P0.3 DATABASE-LEVEL TRANSACTION ATOMICITY & ROLLBACK VERIFIED           ");
+                LogMessage("================================================================================");
+                LogMessage("  DbUpdateException raised on duplicate constraint during SaveChangesAsync()");
+                LogMessage("  Fresh DbContext verified: Original A1 booking intact");
+                LogMessage("  Fresh DbContext verified: Available A2 was NOT inserted");
+                LogMessage("  Fresh DbContext verified: Booking B was NOT inserted");
+                LogMessage("  Fresh DbContext verified: Showtime Status rolled back (still Scheduled)");
+                LogMessage("  Fresh DbContext verified: Exactly 1 total booking & 1 total booked seat");
+                LogMessage("================================================================================");
             }
-        }
-
-        [Fact]
-        public async Task Booking_FailedMultiSeatBooking_PreservesShowtimeStatusAndDoesNotTriggerSoldOut()
-        {
-            // 1. Arrange: Setup Gold Hall (6 rows, 8 seats per row = 38 visible seats)
-            var serviceProvider = BuildServiceProvider(_fixture.ConnectionString);
-            int showtimeId;
-            var initialUserId = $"user-initial-{Guid.NewGuid():N}";
-            var candidateUserId = $"user-candidate-{Guid.NewGuid():N}";
-
-            var template = HallTypeHelper.GetTemplate(HallType.Gold);
-            var totalVisibleSeats = template.VisibleSeatCount; // 38 seats
-
-            // Collect all valid visible seats in Gold hall (Rows 1..6, Seats 1..8 excluding skip seats)
-            var allValidSeats = new List<SeatDto>();
-            for (int r = 1; r <= template.Rows; r++)
-            {
-                int skip = (r == 1) ? 3 : (r == template.Rows ? 2 : 0);
-                for (int s = 1 + skip; s <= template.SeatsPerRow - skip; s++)
-                {
-                    allValidSeats.Add(new SeatDto { Row = r, SeatNumber = s });
-                }
-            }
-
-            Assert.Equal(totalVisibleSeats, allValidSeats.Count);
-
-            // Let's pre-book totalVisibleSeats - 1 seats (leaving exactly 1 seat open)
-            var seatsToPreBook = allValidSeats.Take(totalVisibleSeats - 1).ToList();
-            var lastAvailableSeat = allValidSeats.Last();
-            var alreadyBookedSeat = seatsToPreBook.First();
-
-            using (var scope = serviceProvider.CreateScope())
-            {
-                var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-
-                var hall = new Hall
-                {
-                    Name = $"SoldOut-Hall-{Guid.NewGuid():N}",
-                    Type = HallType.Gold,
-                    TotalRows = template.Rows,
-                    SeatsPerRow = template.SeatsPerRow
-                };
-                db.Halls.Add(hall);
-
-                var movie = new Movie
-                {
-                    Title = $"SoldOut-Movie-{Guid.NewGuid():N}",
-                    TmdbId = Random.Shared.Next(10000, 99999),
-                    Status = MovieStatus.Active,
-                    RuntimeMinutes = 100
-                };
-                db.Movies.Add(movie);
-                await db.SaveChangesAsync();
-
-                var showtime = new Showtime
-                {
-                    HallId = hall.Id,
-                    MovieId = movie.Id,
-                    StartTime = DateTime.UtcNow.AddDays(2),
-                    EndTime = DateTime.UtcNow.AddDays(2).AddHours(2),
-                    Price = 200m,
-                    Status = ShowtimeStatus.Scheduled
-                };
-                db.Showtimes.Add(showtime);
-
-                db.Users.AddRange(
-                    new AppUser { Id = initialUserId, UserName = $"init_{Guid.NewGuid():N}@test.com", Email = $"init_{Guid.NewGuid():N}@test.com", FirstName = "Init", LastName = "User" },
-                    new AppUser { Id = candidateUserId, UserName = $"cand_{Guid.NewGuid():N}@test.com", Email = $"cand_{Guid.NewGuid():N}@test.com", FirstName = "Cand", LastName = "User" }
-                );
-
-                await db.SaveChangesAsync();
-                showtimeId = showtime.Id;
-            }
-
-            // Pre-book 37 seats
-            using (var scope = serviceProvider.CreateScope())
-            {
-                var bookingService = scope.ServiceProvider.GetRequiredService<IBookingService>();
-                var preBookResult = await bookingService.CreateAsync(new BookingCreateDto
-                {
-                    ShowtimeId = showtimeId,
-                    Seats = seatsToPreBook
-                }, initialUserId);
-
-                Assert.True(preBookResult.Succeeded, "Pre-booking initial batch of seats must succeed.");
-            }
-
-            // Verify showtime is still Scheduled (since 1 seat remains)
-            using (var scope = serviceProvider.CreateScope())
-            {
-                var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-                var st = await db.Showtimes.FindAsync(showtimeId);
-                Assert.NotNull(st);
-                Assert.Equal(ShowtimeStatus.Scheduled, st.Status);
-            }
-
-            // 2. Act: Candidate tries to book [alreadyBookedSeat, lastAvailableSeat]
-            // If this had succeeded, total booked would equal totalVisibleSeats and could trigger SoldOut
-            BookingResultDto candidateResult;
-            using (var scope = serviceProvider.CreateScope())
-            {
-                var bookingService = scope.ServiceProvider.GetRequiredService<IBookingService>();
-                candidateResult = await bookingService.CreateAsync(new BookingCreateDto
-                {
-                    ShowtimeId = showtimeId,
-                    Seats = new List<SeatDto> { alreadyBookedSeat, lastAvailableSeat }
-                }, candidateUserId);
-            }
-
-            // 3. Assert
-            Assert.False(candidateResult.Succeeded, "Candidate booking must fail due to already booked seat.");
-
-            using (var scope = serviceProvider.CreateScope())
-            {
-                var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-
-                // A. Showtime Status must still be Scheduled
-                var st = await db.Showtimes.FindAsync(showtimeId);
-                Assert.NotNull(st);
-                Assert.Equal(ShowtimeStatus.Scheduled, st.Status);
-
-                // B. The last available seat must NOT have been booked
-                var isLastSeatBooked = await db.BookedSeats.AnyAsync(s =>
-                    s.ShowtimeId == showtimeId && s.Row == lastAvailableSeat.Row && s.SeatNumber == lastAvailableSeat.SeatNumber);
-                Assert.False(isLastSeatBooked, "The last available seat must remain open.");
-
-                // C. Total booked seats count remains 37
-                var totalBooked = await db.BookedSeats.CountAsync(s => s.ShowtimeId == showtimeId);
-                Assert.Equal(seatsToPreBook.Count, totalBooked);
-
-                LogMessage(" Showtime status & capacity invariant verified successfully: status remains Scheduled.");
-            }
-        }
-
-        private static IServiceProvider BuildServiceProvider(string connectionString)
-        {
-            var services = new ServiceCollection();
-
-            services.AddLogging(builder => builder.AddConsole());
-
-            services.AddDbContext<ApplicationDbContext>(options =>
-                options.UseSqlServer(connectionString));
-
-            var inMemoryConfig = new Dictionary<string, string?>
-            {
-                { "AppTimeZone", "UTC" }
-            };
-            var configuration = new ConfigurationBuilder()
-                .AddInMemoryCollection(inMemoryConfig)
-                .Build();
-
-            services.AddSingleton<IConfiguration>(configuration);
-            services.AddSingleton<TimeConversions>();
-
-            services.AddScoped<IUnitOfWork, UnitOfWork>();
-            services.AddScoped<IBookingRepository, BookingRepository>();
-            services.AddScoped<IBookedSeatRepository, BookedSeatRepository>();
-            services.AddScoped<IShowtimeRepository, ShowtimeRepository>();
-            services.AddScoped<IBookingService, BookingService>();
-
-            return services.BuildServiceProvider();
         }
     }
 }

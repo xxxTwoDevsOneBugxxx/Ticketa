@@ -1,7 +1,7 @@
 ﻿# Ticketa Engineering Context & Verification Log
 
 ## Overview
-This document tracks the technical decisions, architecture, testing phases, and verification milestones for **Ticketa Server** ([ASP.NET](http://ASP.NET) Core 10.0, EF Core, SQL Server, and Testcontainers).
+This document tracks technical decisions, architecture, testing phases, and verification milestones for **Ticketa Server** ([ASP.NET](http://ASP.NET) Core 10.0, EF Core, SQL Server, and Testcontainers).
 
 ---
 
@@ -22,30 +22,32 @@ This document tracks the technical decisions, architecture, testing phases, and 
 - **Scenario**:
   - 50 concurrent users dispatch booking requests for the exact same seat (`Row 1, Seat 1`) simultaneously using non-blocking asynchronous barrier (`TaskCompletionSource`).
 - **Verified Invariants**:
-  -  **Exactly 1 winner** succeeds (`Succeeded == true`, booking reference assigned, amount charged).
-  -  **Exactly 49 losers** receive conflict response (`Succeeded == false`, `ConflictingSeats` contains `[R1S1]`).
-  -  **Database Integrity**: Exactly 1 `Booking` and 1 `BookedSeat` saved in SQL Server. Zero duplicated records.
+  - 🏆 **Exactly 1 winner** succeeds (`Succeeded == true`, booking reference assigned, amount charged).
+  - ❌ **Exactly 49 losers** receive conflict response (`Succeeded == false`, `ConflictingSeats` contains `[R1S1]`).
+  - 🔒 **Database Integrity**: Exactly 1 `Booking` and 1 `BookedSeat` saved in SQL Server. Zero duplicated records.
 
 ---
 
-### Phase 0.3: Atomicity & Transaction Integrity (Testcontainers)
-- **Scope**: All-or-nothing transactional guarantees for multi-seat bookings and capacity state invariants.
+### Phase 0.3: Database-Level Transaction Atomicity & Rollback (Testcontainers)
+- **Scope**: Verify that a multi-seat booking operation is **truly atomic at the database level** during `SaveChangesAsync()`.
 - **Test Class**: [`BookingTransactionAtomicityTests.cs`](file:///C:/Users/moame/RiderProjects/Ticketa/apps/server/Ticketa.Tests/Concurrency/BookingTransactionAtomicityTests.cs)
 - **Environment**: Shared `[Collection("MsSqlCollection")]` running `Testcontainers.MsSql`.
-- **Scenario 1: Multi-Seat Atomic Rollback**:
-  - **Setup**: User A books `Seat (2, 1)`.
-  - **Action**: User B attempts a single request booking `[Seat (2, 1), Seat (2, 2)]` (one taken, one available).
-  - **Verified Invariants**:
-    - Request fails with `Succeeded == false` and lists `Seat (2, 1)` as conflicting.
-    - **No Partial Insertion**: The available seat `Seat (2, 2)` is **NOT** inserted into `BookedSeats`.
-    - **No Orphaned Records**: Zero booking records created for User B. Total `Bookings` count remains 1. Total `BookedSeats` count remains 1.
-- **Scenario 2: Showtime Capacity & SoldOut State Invariant**:
-  - **Setup**: Gold Hall (38 visible seats) with 37 seats pre-booked (1 seat remaining, status `Scheduled`).
-  - **Action**: Candidate attempts to book `[AlreadyBookedSeat, LastAvailableSeat]`.
-  - **Verified Invariants**:
-    - Request fails atomically.
-    - Showtime `Status` **remains `ShowtimeStatus.Scheduled`** and does not prematurely transition to `SoldOut`.
-    - Total booked seats count remains 37, keeping the last seat available for other customers.
+- **Methodology (Direct DbContext Execution)**:
+  - Intentionally bypassed `BookingService.CreateAsync()` to avoid its early in-memory pre-checks (`GetConflictAsync`), forcing the operation directly into the database engine.
+- **Scenario & Execution Flow**:
+  1. **Initial State & Step 1**: User A successfully books `Seat A1 (Row 1, Seat 1)`. Persisted to DB.
+  2. **Step 2 (Database-Level Collision)**: User B attempts a single `SaveChangesAsync()` containing:
+     - `Booking B`
+       - `BookedSeat A1` (duplicate → violates database unique constraint `(ShowtimeId, Row, SeatNumber)`)
+       - `BookedSeat A2` (valid / available)
+     - `Showtime.Status = SoldOut` (related capacity state change attached in the same change set).
+  3. **Trigger**: `SaveChangesAsync()` triggers SQL Server unique index violation → throws `DbUpdateException`.
+  4. **Critical Verification (Fresh DbContext)**:
+     -  **Original A1 Booking Intact**: User A's booking for `Seat A1` remains unchanged.
+     -  **No Partial Persistence of Available Seats**: Valid `Seat A2` was **NOT inserted**.
+     -  **No Orphaned Booking**: `Booking B` was **NOT inserted**.
+     -  **Related State Rolled Back**: `Showtime.Status` remained `Scheduled` and was **NOT** persisted as `SoldOut`.
+     -  **Exact Counts**: Total `Bookings` count == 1, Total `BookedSeats` count == 1.
 
 ---
 
@@ -54,6 +56,6 @@ This document tracks the technical decisions, architecture, testing phases, and 
 | Component | Responsibility | Concurrency / Transaction Guarantee |
 | :--- | :--- | :--- |
 | **`BookedSeat` Unique Index** | `(ShowtimeId, Row, SeatNumber)` | Hard database constraint against concurrent double-booking |
-| **`BookingService.CreateAsync`** | Read conflict check + EF Core `SaveAsync` | Atomic persistence — fails entire seat batch if any seat is contested |
-| **`Showtime.Status`** | `Scheduled` $\leftrightarrow$ `SoldOut` / `Completed` | Transition only when `BookedSeats.Count >= template.VisibleSeatCount` successfully commits |
+| **Database Transaction** | EF Core `SaveChangesAsync` / SQL Server Transaction | Atomic persistence — any constraint violation aborts and rolls back the entire batch |
+| **`Showtime.Status`** | `Scheduled` $\leftrightarrow$ `SoldOut` / `Completed` | Changes rolled back atomically if booking fails |
 | **Test Fixture** | `MsSqlDatabaseFixture` | Real SQL Server container initialized with EF Core migrations |
