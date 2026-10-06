@@ -184,12 +184,17 @@ namespace Ticketa.Tests.Infrastructure.Services
         ClientSecret = DefaultClientSecret
       };
 
+      RequestOptions? capturedRequestOptions = null;
       _mockPaymentIntentService
           .Setup(s => s.CreateAsync(
               It.IsAny<PaymentIntentCreateOptions>(),
               It.IsAny<RequestOptions>(),
               It.IsAny<CancellationToken>()))
-          .Callback<PaymentIntentCreateOptions, RequestOptions, CancellationToken>((opts, _, _) => capturedOptions = opts)
+          .Callback<PaymentIntentCreateOptions, RequestOptions, CancellationToken>((opts, req, _) =>
+          {
+            capturedOptions = opts;
+            capturedRequestOptions = req;
+          })
           .ReturnsAsync(stripeIntent);
 
       Payment? capturedPayment = null;
@@ -206,6 +211,11 @@ namespace Ticketa.Tests.Infrastructure.Services
       Assert.Equal(DefaultPaymentIntentId, result.PaymentIntentId);
       Assert.Equal(DefaultClientSecret, result.ClientSecret);
       Assert.Equal(250m, result.TotalAmount);
+
+      // Verify deterministic Stripe IdempotencyKey
+      Assert.NotNull(capturedRequestOptions);
+      Assert.StartsWith("pi_", capturedRequestOptions.IdempotencyKey);
+      Assert.Contains(DefaultUserId, capturedRequestOptions.IdempotencyKey);
 
       // Verify Stripe amount converted to minor units (250 * 100 = 25000)
       Assert.NotNull(capturedOptions);
@@ -358,7 +368,7 @@ namespace Ticketa.Tests.Infrastructure.Services
           .ReturnsAsync(payment);
 
       _mockBookingService
-          .Setup(b => b.CreateAsync(It.IsAny<BookingCreateDto>(), DefaultUserId, It.IsAny<CancellationToken>()))
+          .Setup(b => b.CreateForPaymentAsync(It.IsAny<BookingCreateDto>(), DefaultUserId, It.IsAny<Payment>(), It.IsAny<CancellationToken>()))
           .ReturnsAsync(BookingResultDto.Success(DefaultBookingRef, 100m));
 
       var bookingDetails = new BookingDetailsDto
@@ -388,9 +398,6 @@ namespace Ticketa.Tests.Infrastructure.Services
       // Assert
       Assert.True(result.Succeeded);
       Assert.Equal(DefaultBookingRef, result.BookingReference);
-      Assert.Equal(PaymentStatus.Completed, payment.Status);
-      Assert.Equal(DefaultBookingRef, payment.BookingReference);
-      Assert.NotNull(payment.CompletedAt);
 
       _mockQrCodeService.Verify(q => q.GeneratePng("http://localhost:5173/bookings/" + DefaultBookingRef, It.IsAny<int>()), Times.Once);
       _mockEmailService.Verify(e => e.SendEmailWithInlineImageAsync(
@@ -400,8 +407,6 @@ namespace Ticketa.Tests.Infrastructure.Services
           fakeQrBytes,
           "ticket-qr",
           It.IsAny<CancellationToken>()), Times.Once);
-
-      _mockUow.Verify(u => u.SaveAsync(), Times.Once);
     }
 
     [Fact]
@@ -436,13 +441,18 @@ namespace Ticketa.Tests.Infrastructure.Services
           .ReturnsAsync(payment);
 
       _mockBookingService
-          .Setup(b => b.CreateAsync(It.IsAny<BookingCreateDto>(), DefaultUserId, It.IsAny<CancellationToken>()))
+          .Setup(b => b.CreateForPaymentAsync(It.IsAny<BookingCreateDto>(), DefaultUserId, It.IsAny<Payment>(), It.IsAny<CancellationToken>()))
           .ReturnsAsync(BookingResultDto.Conflict(seats));
 
       RefundCreateOptions? capturedRefundOptions = null;
+      RequestOptions? capturedRefundRequestOptions = null;
       _mockRefundService
           .Setup(r => r.CreateAsync(It.IsAny<RefundCreateOptions>(), It.IsAny<RequestOptions>(), It.IsAny<CancellationToken>()))
-          .Callback<RefundCreateOptions, RequestOptions, CancellationToken>((opts, _, _) => capturedRefundOptions = opts)
+          .Callback<RefundCreateOptions, RequestOptions, CancellationToken>((opts, req, _) =>
+          {
+            capturedRefundOptions = opts;
+            capturedRefundRequestOptions = req;
+          })
           .ReturnsAsync(new Refund { Id = "re_123" });
 
       // Act
@@ -452,9 +462,11 @@ namespace Ticketa.Tests.Infrastructure.Services
       Assert.False(result.Succeeded);
       Assert.NotEmpty(result.ConflictingSeats);
 
-      // Verify Stripe Refund was triggered with the PaymentIntentId
+      // Verify Stripe Refund was triggered with the PaymentIntentId & deterministic IdempotencyKey
       Assert.NotNull(capturedRefundOptions);
       Assert.Equal(DefaultPaymentIntentId, capturedRefundOptions.PaymentIntent);
+      Assert.NotNull(capturedRefundRequestOptions);
+      Assert.Equal($"rf_{DefaultPaymentIntentId}", capturedRefundRequestOptions.IdempotencyKey);
 
       // Verify Payment record status is Refunded
       Assert.Equal(PaymentStatus.Refunded, payment.Status);
@@ -495,7 +507,7 @@ namespace Ticketa.Tests.Infrastructure.Services
           .ReturnsAsync(payment);
 
       _mockBookingService
-          .Setup(b => b.CreateAsync(It.IsAny<BookingCreateDto>(), DefaultUserId, It.IsAny<CancellationToken>()))
+          .Setup(b => b.CreateForPaymentAsync(It.IsAny<BookingCreateDto>(), DefaultUserId, It.IsAny<Payment>(), It.IsAny<CancellationToken>()))
           .ReturnsAsync(BookingResultDto.Success(DefaultBookingRef, 100m));
 
       var bookingDetails = new BookingDetailsDto
@@ -533,8 +545,6 @@ namespace Ticketa.Tests.Infrastructure.Services
       // Assert: Result is STILL SUCCESS even when email fails
       Assert.True(result.Succeeded);
       Assert.Equal(DefaultBookingRef, result.BookingReference);
-      Assert.Equal(PaymentStatus.Completed, payment.Status);
-      _mockUow.Verify(u => u.SaveAsync(), Times.Once);
     }
 
     #endregion

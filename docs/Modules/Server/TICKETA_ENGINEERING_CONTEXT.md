@@ -312,16 +312,14 @@ Prevent multiple logical operations for the same business action.
 
 Allow retries of the same operation without creating another logical external operation.
 
-Future review:
+### Implemented P0.4 Idempotency Architecture:
 
-* who owns the idempotency key?
-* is it stable across retries?
-* what exact operation does it identify?
-* how are client retries handled?
-* how are server retries handled?
-* how are payment and booking states reconciled?
-
-Do not assume a new random key per retry is equivalent to idempotent retry behavior.
+* **Stripe Idempotency Key**: Deterministically generated on the server (`$"pi_{userId}_{showtimeId}_{seatHash}"` and `$"rf_{paymentIntentId}"` for refunds). Prevents duplicate Stripe PaymentIntents and duplicate refunds.
+* **Concurrency Convergence**: Concurrent `create-intent` calls catch database unique constraint violations on `(UserId, ShowtimeId, SeatHash)` and gracefully converge on the winner's payment record.
+* **Atomic Local Execution**: Booking creation, booked seats, showtime status updates, and `Payment.Status = Completed` are enlisted in the same UnitOfWork change tracker and committed in a single atomic SQL Server transaction via `CreateForPaymentAsync`.
+* **Crash Recovery & Reconciliation**: If a crash occurs after booking creation, subsequent `confirm-payment` retries reconcile the existing booking instead of misidentifying it as a seat conflict and issuing an erroneous refund.
+* **Refund Idempotency**: Refunded payments immediately reject repeat confirmations with conflict status and never invoke Stripe's Refund API more than once.
+* **Email & QR Isolation**: Failures during QR generation or SMTP email delivery are isolated and do not roll back or fail the confirmed booking.
 
 ## 11. Booking Reference / Anonymous Lookup
 
@@ -557,7 +555,7 @@ This feature can teach:
 * [x] booking race-condition integration test
 * [x] verify unique booked-seat constraint
 * [x] verify transaction behavior
-* [ ] verify payment idempotency/retry semantics
+* [x] verify payment idempotency/retry semantics
 
 ### Phase 2 — SQL / EF Performance
 
@@ -725,7 +723,7 @@ Why was the final approach selected?
 * [x] Booking concurrency integration test
 * [x] Verify unique booked-seat constraint
 * [x] Verify transaction behavior
-* [ ] Verify payment retry/idempotency semantics
+* [x] Verify payment retry/idempotency semantics
 
 ### P1 — Performance
 
