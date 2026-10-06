@@ -1,4 +1,5 @@
-﻿using Microsoft.Extensions.Configuration;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Stripe;
 using System.Text.Json;
@@ -47,37 +48,68 @@ namespace Ticketa.Infrastructure.Service
       var seats = JsonSerializer.Deserialize<List<SeatDto>>(paymentIntent.Metadata["seats"])!;
 
       var payment = await _uow.Payments.GetAsync(p => p.StripePaymentIntentId == paymentIntentId);
+      if (payment is null)
+        return BookingResultDto.Failure("Payment record not found.");
 
-      if (payment is not null && payment.Status == PaymentStatus.Completed)
+      // 1. Idempotency Check: Already Completed (cached success)
+      if (payment.Status == PaymentStatus.Completed)
       {
         _logger.LogInformation("Payment {IntentId} already processed (Completed), returning cached result", paymentIntentId);
         return BookingResultDto.Success(payment.BookingReference ?? "", payment.TotalAmount);
       }
 
-      var bookingDto = new BookingCreateDto { ShowtimeId = showtimeId, Seats = seats };
-      var result = await _bookingService.CreateAsync(bookingDto, userId, ct);
+      // 2. Idempotency Check: Already Refunded (Requirement 10)
+      if (payment.Status == PaymentStatus.Refunded)
+      {
+        _logger.LogWarning("Payment {IntentId} was already refunded, rejecting repeat confirmation", paymentIntentId);
+        return BookingResultDto.Conflict(seats);
+      }
 
+      // 3. Crash Recovery / Reconciliation Check (Requirement 8)
+      if (!string.IsNullOrEmpty(payment.BookingReference))
+      {
+        var existingBooking = await _uow.Bookings.GetBookingByRefrenceAsync(payment.BookingReference, ct);
+        if (existingBooking is not null)
+        {
+          _logger.LogInformation("Reconciled existing booking {Reference} for Payment {IntentId}", existingBooking.BookingRefrence, paymentIntentId);
+          payment.Status = PaymentStatus.Completed;
+          payment.CompletedAt ??= DateTime.UtcNow;
+          await _uow.SaveAsync();
+          return BookingResultDto.Success(existingBooking.BookingRefrence, existingBooking.TotalAmount);
+        }
+      }
+
+      // 4. Atomic Execution: Create Booking + BookedSeats + Payment Completed in a single transaction
+      var bookingDto = new BookingCreateDto { ShowtimeId = showtimeId, Seats = seats };
+      var result = await _bookingService.CreateForPaymentAsync(bookingDto, userId, payment, ct);
+
+      // 5. Conflict & Refund Handling
       if (!result.Succeeded && result.ConflictingSeats.Count > 0)
       {
-        await _refundService.CreateAsync(
-            new RefundCreateOptions { PaymentIntent = paymentIntentId },
-            cancellationToken: ct
-          );
-
-        if (payment is not null)
+        // Double-check: Did a concurrent request just complete this payment? (Requirement 6)
+        var reloaded = await _uow.Payments.GetAsync(p => p.StripePaymentIntentId == paymentIntentId);
+        if (reloaded is not null && reloaded.Status == PaymentStatus.Completed)
         {
+          _logger.LogInformation("Concurrent confirmation detected: Payment {IntentId} already completed", paymentIntentId);
+          return BookingResultDto.Success(reloaded.BookingReference ?? "", reloaded.TotalAmount);
+        }
+
+        // Genuine conflict: Trigger refund ONCE with stable idempotency key (Requirements 9 & 10)
+        if (payment.Status != PaymentStatus.Refunded)
+        {
+          var refundOptions = new RefundCreateOptions { PaymentIntent = paymentIntentId };
+          var refundRequestOptions = new RequestOptions { IdempotencyKey = $"rf_{paymentIntentId}" };
+
+          await _refundService.CreateAsync(refundOptions, refundRequestOptions, cancellationToken: ct);
+
           payment.Status = PaymentStatus.Refunded;
           payment.RefundedAt = DateTime.UtcNow;
           await _uow.SaveAsync();
         }
       }
-      else if (result.Succeeded && payment is not null)
+      else if (result.Succeeded)
       {
-        payment.BookingReference = result.BookingReference;
-        payment.Status = PaymentStatus.Completed;
-        payment.CompletedAt = DateTime.UtcNow;
-        await _uow.SaveAsync();
-
+        // 6. Confirmation Email & QR Code (isolated in try-catch, Requirement 11)
         try
         {
           var details = await _bookingService.GetByReferenceAsync(result.BookingReference!, ct);
@@ -131,6 +163,7 @@ namespace Ticketa.Infrastructure.Service
       dto.Seats = dto.Seats.OrderBy(s => s.Row).ThenBy(s => s.SeatNumber).ToList();
       var seatHash = ComputeSeatHash(dto.Seats);
 
+      // 1. Repeating create-intent returns existing local Payment without calling Stripe
       var dedupSpec = new PaymentSpecification(userId, dto.ShowtimeId, seatHash);
       var existing = await _uow.Payments.GetEntityWithSpecAsync(dedupSpec, ct);
       if (existing is not null)
@@ -172,9 +205,10 @@ namespace Ticketa.Infrastructure.Service
         },
       };
 
+      // 2. Stable Stripe Idempotency Key (Requirement 3)
       var requestOptions = new RequestOptions
       {
-        IdempotencyKey = Guid.NewGuid().ToString("N")
+        IdempotencyKey = GenerateStripeIdempotencyKey(userId, dto.ShowtimeId, seatHash)
       };
 
       var paymnetIntent = await _paymentIntentService.CreateAsync(options, requestOptions, ct);
@@ -194,8 +228,30 @@ namespace Ticketa.Infrastructure.Service
         PaymentSeats = paymentSeats
       };
 
-      await _uow.Payments.CreateAsync(payment);
-      await _uow.SaveAsync();
+      // 3. Concurrent create-intent requests converge on one Payment operation (Requirement 4)
+      try
+      {
+        await _uow.Payments.CreateAsync(payment);
+        await _uow.SaveAsync();
+      }
+      catch (DbUpdateException ex)
+      {
+        _logger.LogWarning(ex, "Concurrent create-intent collision for User={UserId}, Showtime={ShowtimeId}, Seats={SeatHash}. Converging on existing payment.",
+          userId, dto.ShowtimeId, seatHash);
+
+        var winner = await _uow.Payments.GetEntityWithSpecAsync(dedupSpec, ct);
+        if (winner is not null)
+        {
+          return new PaymentIntentResultDto
+          {
+            ClientSecret = winner.ClientSecret,
+            PaymentIntentId = winner.StripePaymentIntentId,
+            TotalAmount = winner.TotalAmount
+          };
+        }
+
+        throw;
+      }
 
       return new PaymentIntentResultDto
       {
@@ -203,6 +259,15 @@ namespace Ticketa.Infrastructure.Service
         PaymentIntentId = paymnetIntent.Id,
         TotalAmount = totalAmount
       };
+    }
+
+    private static string GenerateStripeIdempotencyKey(string userId, int showtimeId, string seatHash)
+    {
+      var raw = $"pi_{userId}_{showtimeId}_{seatHash}";
+      if (raw.Length <= 100) return raw;
+
+      var hashBytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(raw));
+      return $"pi_{Convert.ToHexString(hashBytes)}";
     }
 
     private static string ComputeSeatHash(IEnumerable<SeatDto> seats)

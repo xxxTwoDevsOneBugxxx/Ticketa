@@ -1,4 +1,4 @@
-﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Ticketa.Core.DTOs;
 using Ticketa.Core.Entities;
@@ -15,10 +15,20 @@ namespace Ticketa.Infrastructure.Service
     private readonly IUnitOfWork _uow = uow;
     private readonly ILogger<BookingService> _logger = logger;
 
-    public async Task<BookingResultDto> CreateAsync(BookingCreateDto dto, string userId, CancellationToken ct = default)
+    public Task<BookingResultDto> CreateAsync(BookingCreateDto dto, string userId, CancellationToken ct = default)
     {
-      _logger.LogInformation("Booking attempt: ShowtimeId={ShowtimeId}, Seats={Seats}, UserId={UserId}",
-        dto.ShowtimeId, dto.Seats.Select(s => $"R{s.Row}S{s.SeatNumber}"), userId);
+      return CreateInternalAsync(dto, userId, payment: null, ct);
+    }
+
+    public Task<BookingResultDto> CreateForPaymentAsync(BookingCreateDto dto, string userId, Payment payment, CancellationToken ct = default)
+    {
+      return CreateInternalAsync(dto, userId, payment, ct);
+    }
+
+    private async Task<BookingResultDto> CreateInternalAsync(BookingCreateDto dto, string userId, Payment? payment, CancellationToken ct = default)
+    {
+      _logger.LogInformation("Booking attempt: ShowtimeId={ShowtimeId}, Seats={Seats}, UserId={UserId}, PaymentId={PaymentId}",
+        dto.ShowtimeId, dto.Seats.Select(s => $"R{s.Row}S{s.SeatNumber}"), userId, payment?.Id);
 
       var spec = new ShowtimeByIdSpecification(dto.ShowtimeId);
       var showtime = await _uow.Showtimes.GetEntityWithSpecAsync(spec, ct);
@@ -33,6 +43,21 @@ namespace Ticketa.Infrastructure.Service
 
       if (conflict.Count > 0)
       {
+        // Crash / Retry Reconciliation:
+        // If payment already has a BookingReference and that booking exists for this showtime & user, reconcile!
+        if (payment is not null && !string.IsNullOrEmpty(payment.BookingReference))
+        {
+          var existingBooking = await _uow.Bookings.GetBookingByRefrenceAsync(payment.BookingReference, ct);
+          if (existingBooking is not null && existingBooking.ShowtimeId == dto.ShowtimeId && existingBooking.UserId == userId)
+          {
+            _logger.LogInformation("Reconciled existing booking {Reference} for Payment {PaymentId}", existingBooking.BookingRefrence, payment.Id);
+            payment.Status = PaymentStatus.Completed;
+            payment.CompletedAt ??= DateTime.UtcNow;
+            await _uow.SaveAsync();
+            return BookingResultDto.Success(existingBooking.BookingRefrence, existingBooking.TotalAmount);
+          }
+        }
+
         _logger.LogWarning("Booking conflict: seats already booked. Conflicts={Conflicts}",
           conflict.Select(c => $"R{c.Row}S{c.SeatNumber}"));
         return BookingResultDto.Conflict(conflict.Select(c => new SeatDto { Row = c.Row, SeatNumber = c.SeatNumber }).ToList());
@@ -55,6 +80,8 @@ namespace Ticketa.Infrastructure.Service
         };
       }).ToList();
 
+      var bookingRef = payment?.BookingReference ?? GenerateRefrence();
+
       var booking = new Booking
       {
         UserId = userId,
@@ -62,11 +89,18 @@ namespace Ticketa.Infrastructure.Service
         BookedAt = DateTime.UtcNow,
         TotalAmount = bookedSeats.Sum(s => s.Price),
         Status = Core.Enums.BookingStatus.Confirmed,
-        BookingRefrence = GenerateRefrence(),
+        BookingRefrence = bookingRef,
         BookedSeats = bookedSeats
       };
 
       await _uow.Bookings.CreateAsync(booking);
+
+      if (payment is not null)
+      {
+        payment.BookingReference = bookingRef;
+        payment.Status = PaymentStatus.Completed;
+        payment.CompletedAt = DateTime.UtcNow;
+      }
 
       var existingBookedCount = await _uow.BookedSeats.CountAsync(
           new BookedSeatByShowtimeIdSpecification(dto.ShowtimeId));
@@ -80,11 +114,25 @@ namespace Ticketa.Infrastructure.Service
 
       try
       {
+        // Single atomic transaction persists: Booking + BookedSeats + Showtime status (+ Payment completion if present)
         await _uow.SaveAsync();
       }
       catch (DbUpdateException ex)
       {
         _logger.LogWarning(ex, "Booking save conflict");
+
+        // Concurrent confirmation check: Did a concurrent request complete this payment?
+        if (payment is not null)
+        {
+          var reloadedPayment = await _uow.Payments.GetAsync(p => p.Id == payment.Id);
+          if (reloadedPayment is not null && reloadedPayment.Status == PaymentStatus.Completed && !string.IsNullOrEmpty(reloadedPayment.BookingReference))
+          {
+            _logger.LogInformation("Concurrent request successfully completed payment {PaymentId} with booking {Reference}",
+              payment.Id, reloadedPayment.BookingReference);
+            return BookingResultDto.Success(reloadedPayment.BookingReference, reloadedPayment.TotalAmount);
+          }
+        }
+
         var lateConflict = await _uow.BookedSeats
           .GetConflictAsync(dto.ShowtimeId, dto.Seats, ct);
 
