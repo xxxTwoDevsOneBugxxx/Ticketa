@@ -554,9 +554,9 @@ This feature can teach:
 
 ### Phase 1 — Correctness / Concurrency
 
-* [ ] booking race-condition integration test
-* [ ] verify unique booked-seat constraint
-* [ ] verify transaction behavior
+* [x] booking race-condition integration test
+* [x] verify unique booked-seat constraint
+* [x] verify transaction behavior
 * [ ] verify payment idempotency/retry semantics
 
 ### Phase 2 — SQL / EF Performance
@@ -724,7 +724,7 @@ Why was the final approach selected?
 
 * [x] Booking concurrency integration test
 * [x] Verify unique booked-seat constraint
-* [ ] Verify transaction behavior
+* [x] Verify transaction behavior
 * [ ] Verify payment retry/idempotency semantics
 
 ### P1 — Performance
