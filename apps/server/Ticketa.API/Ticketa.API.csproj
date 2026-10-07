@@ -24,4 +24,9 @@
     <ProjectReference Include="..\Ticketa.Infrastructure\Ticketa.Infrastructure.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Remove="Properties\PublishProfiles\ticketa.runasp.net-WebDeploy.publishSettings" />
+    <None Remove="Properties\PublishProfiles\Ticketa.pubxml" />
+  </ItemGroup>
+
 </Project>
