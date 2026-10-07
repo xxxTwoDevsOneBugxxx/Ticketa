@@ -60,7 +60,8 @@ namespace Ticketa.Tests.Infrastructure.Services
 
       var inMemorySettings = new Dictionary<string, string?>
       {
-        { "ClientSettings:BaseUrl", "http://localhost:5173" }
+        { "ClientSettings:BaseUrl", "http://localhost:5173" },
+        { "EmailSettings:SendSynchronously", "true" }
       };
       _configuration = new ConfigurationBuilder()
           .AddInMemoryCollection(inMemorySettings)

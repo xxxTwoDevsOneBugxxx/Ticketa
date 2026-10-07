@@ -287,6 +287,193 @@ namespace Ticketa.Tests.Concurrency
       }
     }
 
+    [Fact]
+    public async Task ConfirmPayment_ConcurrentRequestsForSamePayment_CreateSingleBooking()
+    {
+      // 1. Preconditions / Arrange:
+      // Seed 1 Hall, 1 Movie, 1 Showtime, 1 User, 1 Pending Payment with 3 seats (A1, A2, A3)
+      int showtimeId;
+      var userId = $"user-concurrent-{Guid.NewGuid():N}";
+      var paymentIntentId = $"pi_test_concurrent_{Guid.NewGuid():N}";
+      var seats = new List<SeatDto>
+      {
+        new() { Row = 1, SeatNumber = 1 },
+        new() { Row = 1, SeatNumber = 2 },
+        new() { Row = 1, SeatNumber = 3 }
+      };
+      var seatsJson = System.Text.Json.JsonSerializer.Serialize(seats);
+
+      await using (var db = CreateDbContext())
+      {
+        var hall = new Hall
+        {
+          Name = $"Concurrent-Hall-{Guid.NewGuid():N}",
+          Type = HallType.Standard,
+          TotalRows = 10,
+          SeatsPerRow = 10
+        };
+        db.Halls.Add(hall);
+
+        var movie = new Movie
+        {
+          Title = $"Concurrent-Movie-{Guid.NewGuid():N}",
+          TmdbId = Random.Shared.Next(100000, 999999),
+          Status = MovieStatus.Active,
+          RuntimeMinutes = 120
+        };
+        db.Movies.Add(movie);
+        await db.SaveChangesAsync();
+
+        var showtime = new Showtime
+        {
+          HallId = hall.Id,
+          MovieId = movie.Id,
+          StartTime = DateTime.UtcNow.AddDays(1),
+          EndTime = DateTime.UtcNow.AddDays(1).AddHours(2),
+          Price = 100m,
+          Status = ShowtimeStatus.Scheduled
+        };
+        db.Showtimes.Add(showtime);
+
+        db.Users.Add(new AppUser
+        {
+          Id = userId,
+          UserName = $"user_{Guid.NewGuid():N}@test.com",
+          Email = $"user_{Guid.NewGuid():N}@test.com",
+          FirstName = "Concurrent",
+          LastName = "User"
+        });
+
+        await db.SaveChangesAsync();
+        showtimeId = showtime.Id;
+
+        var payment = new Payment
+        {
+          StripePaymentIntentId = paymentIntentId,
+          ClientSecret = $"{paymentIntentId}_secret",
+          UserId = userId,
+          ShowtimeId = showtimeId,
+          TotalAmount = 300m,
+          Currency = "AED",
+          Status = PaymentStatus.Pending,
+          SeatHash = "1:1,1:2,1:3",
+          SeatCount = 3,
+          CreatedAt = DateTime.UtcNow
+        };
+        db.Payments.Add(payment);
+
+        await db.SaveChangesAsync();
+      }
+
+      // Configure Fake Stripe Service
+      var mockStripe = new Mock<PaymentIntentService>();
+      mockStripe
+          .Setup(s => s.GetAsync(paymentIntentId, It.IsAny<PaymentIntentGetOptions>(), It.IsAny<RequestOptions>(), It.IsAny<CancellationToken>()))
+          .ReturnsAsync(new PaymentIntent
+          {
+            Id = paymentIntentId,
+            Status = "succeeded",
+            Metadata = new Dictionary<string, string>
+            {
+              { "userId", userId },
+              { "showtimeId", showtimeId.ToString() },
+              { "seats", seatsJson }
+            }
+          });
+
+      var mockRefund = new Mock<RefundService>();
+
+      var serviceProvider = BuildServiceProvider(_fixture.ConnectionString, mockStripe.Object, mockRefund.Object);
+
+      // 2. Concurrent Requests: 20 simultaneous ConfirmAsync calls starting together
+      const int confirmCount = 20;
+      var startGate = new ManualResetEventSlim(false);
+
+      var tasks = Enumerable.Range(0, confirmCount)
+          .Select(_ => Task.Run(async () =>
+          {
+            using var scope = serviceProvider.CreateScope();
+            var paymentService = scope.ServiceProvider.GetRequiredService<IPaymentService>();
+
+            startGate.Wait();
+
+            return await paymentService.ConfirmAsync(
+                paymentIntentId,
+                userId,
+                CancellationToken.None);
+          }))
+          .ToArray();
+
+      startGate.Set(); // Release all tasks simultaneously
+
+      var results = await Task.WhenAll(tasks);
+
+      // 3. Result Assertions
+      var successfulBookings = results
+          .Where(r => r.Succeeded)
+          .Select(r => r.BookingReference)
+          .Distinct()
+          .ToList();
+
+      Assert.Single(successfulBookings);
+      var canonicalBookingRef = successfulBookings.First();
+      Assert.False(string.IsNullOrWhiteSpace(canonicalBookingRef));
+
+      // 4. Refund Assertions: Zero refunds triggered
+      mockRefund.Verify(r => r.CreateAsync(
+          It.IsAny<RefundCreateOptions>(),
+          It.IsAny<RequestOptions>(),
+          It.IsAny<CancellationToken>()), Times.Never);
+
+      // 5. Fresh DbContext Assertions
+      await using (var db = CreateDbContext())
+      {
+        // Payment Assertions
+        var paymentInDb = await db.Payments.FirstOrDefaultAsync(p => p.StripePaymentIntentId == paymentIntentId);
+        Assert.NotNull(paymentInDb);
+        Assert.Equal(PaymentStatus.Completed, paymentInDb.Status);
+        Assert.Equal(canonicalBookingRef, paymentInDb.BookingReference);
+
+        var totalPayments = await db.Payments.CountAsync(p => p.StripePaymentIntentId == paymentIntentId);
+        Assert.Equal(1, totalPayments);
+
+        // Booking Assertions
+        var bookingsInDb = await db.Bookings
+            .Include(b => b.BookedSeats)
+            .Where(b => b.ShowtimeId == showtimeId && b.UserId == userId)
+            .ToListAsync();
+
+        Assert.Single(bookingsInDb);
+        var booking = bookingsInDb[0];
+        Assert.Equal(userId, booking.UserId);
+        Assert.Equal(showtimeId, booking.ShowtimeId);
+        Assert.Equal(300m, booking.TotalAmount);
+        Assert.Equal(BookingStatus.Confirmed, booking.Status);
+        Assert.Equal(canonicalBookingRef, booking.BookingRefrence);
+        Assert.Equal(3, booking.BookedSeats.Count);
+
+        // Booked Seat Assertions: Each expected seat exists exactly once
+        var bookedSeatsInDb = await db.BookedSeats
+            .Where(s => s.ShowtimeId == showtimeId)
+            .ToListAsync();
+
+        Assert.Equal(3, bookedSeatsInDb.Count);
+        Assert.Contains(bookedSeatsInDb, s => s.Row == 1 && s.SeatNumber == 1);
+        Assert.Contains(bookedSeatsInDb, s => s.Row == 1 && s.SeatNumber == 2);
+        Assert.Contains(bookedSeatsInDb, s => s.Row == 1 && s.SeatNumber == 3);
+
+        LogMessage("================================================================================");
+        LogMessage("   P0.4 CONCURRENT CONFIRM INTEGRATION TEST VERIFIED SUCCESSFULLY               ");
+        LogMessage("================================================================================");
+        LogMessage($"  20 concurrent ConfirmAsync requests converged on Booking: {canonicalBookingRef}");
+        LogMessage("  Exactly 1 Payment in database (Status = Completed)");
+        LogMessage("  Exactly 1 Booking in database");
+        LogMessage("  Exactly 3 BookedSeats in database (no duplicates)");
+        LogMessage("  Exactly 0 Stripe refunds triggered (no accidental refund)");
+        LogMessage("================================================================================");
+      }
+    }
+
     private static IServiceProvider BuildServiceProvider(string connectionString, PaymentIntentService stripeService, RefundService refundService)
     {
       var services = new ServiceCollection();

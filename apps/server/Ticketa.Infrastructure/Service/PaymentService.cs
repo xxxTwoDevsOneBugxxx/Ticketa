@@ -94,6 +94,19 @@ namespace Ticketa.Infrastructure.Service
           return BookingResultDto.Success(reloaded.BookingReference ?? "", reloaded.TotalAmount);
         }
 
+        // Double-check: Did a booking already succeed for this user and showtime?
+        var userBooking = await _uow.Bookings.GetAsync(b => b.UserId == userId && b.ShowtimeId == showtimeId && b.Status == BookingStatus.Confirmed);
+        if (userBooking is not null)
+        {
+          _logger.LogInformation("Concurrent booking already confirmed for User {UserId}, Showtime {ShowtimeId}: {Reference}",
+            userId, showtimeId, userBooking.BookingRefrence);
+          payment.BookingReference = userBooking.BookingRefrence;
+          payment.Status = PaymentStatus.Completed;
+          payment.CompletedAt ??= DateTime.UtcNow;
+          await _uow.SaveAsync();
+          return BookingResultDto.Success(userBooking.BookingRefrence, userBooking.TotalAmount);
+        }
+
         // Genuine conflict: Trigger refund ONCE with stable idempotency key (Requirements 9 & 10)
         if (payment.Status != PaymentStatus.Refunded)
         {
@@ -135,13 +148,37 @@ namespace Ticketa.Infrastructure.Service
                 cid,
                 backdropUrl);
 
-            await _emailService.SendEmailWithInlineImageAsync(
-                details.CustomerEmail,
-                "Your Ticketa Booking Confirmation",
-                html,
-                qrBytes,
-                cid,
-                ct);
+            var sendSync = _configuration.GetValue<bool>("EmailSettings:SendSynchronously", false);
+            if (sendSync)
+            {
+              await _emailService.SendEmailWithInlineImageAsync(
+                  details.CustomerEmail,
+                  "Your Ticketa Booking Confirmation",
+                  html,
+                  qrBytes,
+                  cid,
+                  ct);
+            }
+            else
+            {
+              _ = Task.Run(async () =>
+              {
+                try
+                {
+                  await _emailService.SendEmailWithInlineImageAsync(
+                      details.CustomerEmail,
+                      "Your Ticketa Booking Confirmation",
+                      html,
+                      qrBytes,
+                      cid,
+                      CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                  _logger.LogError(ex, "Background ticket email failed for booking {Reference}", result.BookingReference);
+                }
+              });
+            }
           }
         }
         catch (Exception ex)
