@@ -29,7 +29,9 @@ namespace Ticketa.Infrastructure.Service
     private async Task<IEnumerable<MovieShowtimeDto>> GetAllDataAsync(
         string? search,
         string? segmentedFilter,
-        bool archivedOnly)
+        bool archivedOnly,
+        DateTime? fromDate = null,
+        DateTime? toDate = null)
     {
       ShowtimeStatus? status = segmentedFilter?.ToLower() switch
       {
@@ -42,7 +44,7 @@ namespace Ticketa.Infrastructure.Service
       var query = string.IsNullOrWhiteSpace(search) ? null : search;
 
       var showtimes = await _uow.Showtimes.GetAllWithSpecAsync(
-          new ShowtimeSpecification(status, query, archivedOnly: archivedOnly));
+          new ShowtimeSpecification(status, query, archivedOnly: archivedOnly, fromDate: fromDate, toDate: toDate));
 
       return showtimes
           .GroupBy(s => s.MovieId)
@@ -335,7 +337,9 @@ namespace Ticketa.Infrastructure.Service
 
     public async Task<IEnumerable<MovieShowtimeDto>> GetScheduledGroupedAsync(CancellationToken ct = default)
     {
-      return await GetAllAsync(search: null, segmentedFilter: "scheduled");
+      var fromDate = DateTime.UtcNow.AddHours(-2);
+      var toDate = DateTime.UtcNow.AddDays(60);
+      return await GetAllDataAsync(search: null, segmentedFilter: "scheduled", archivedOnly: false, fromDate: fromDate, toDate: toDate);
     }
 
     public async Task<ShowtimeSeatDto?> GetSeatMapAsync(
