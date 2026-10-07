@@ -51,13 +51,14 @@ export function movieByGenre(movies: Movie[]) {
       const genreMap = new Map<string, Movie[]>();
 
     movies.forEach((movie) => {
-      if (movie.genres.length === 0) {
+      const genres = movie.genres ?? [];
+      if (genres.length === 0) {
         const list = genreMap.get("All Now Showing") || [];
         list.push(movie);
         genreMap.set("All Now Showing", list);
         return;
       }
-      const primaryGenre = movie.genres[0];
+      const primaryGenre = genres[0];
       const list = genreMap.get(primaryGenre) || [];
       list.push(movie);
       genreMap.set(primaryGenre, list);

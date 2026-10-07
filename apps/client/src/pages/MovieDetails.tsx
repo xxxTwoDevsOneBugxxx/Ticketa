@@ -107,7 +107,7 @@ const MovieDetailsPage = () => {
               animate={{ opacity: 1, y: 0 }}
               className="flex flex-wrap gap-3"
             >
-              {movie.genres.map((genre) => (
+              {movie.genres?.map((genre) => (
                 <span
                   key={genre}
                   className="px-4 py-1.5 rounded-full bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 text-[10px] font-black uppercase tracking-[0.2em] text-black/60 dark:text-white/60 backdrop-blur-md"

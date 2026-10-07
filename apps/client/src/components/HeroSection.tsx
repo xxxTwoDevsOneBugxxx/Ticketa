@@ -137,7 +137,7 @@ const HeroSection = ({ movies }: HeroSectionProps) => {
                 </p>
 
                 <div className="flex flex-wrap items-center gap-4 text-sm font-black uppercase tracking-[0.2em] text-primary">
-                  {currentMovie.genres.join(" • ")}
+                  {currentMovie.genres?.join(" • ") ?? ""}
                 </div>
 
                 <div className="flex flex-wrap items-center gap-4 pt-4">

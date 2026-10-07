@@ -28,10 +28,10 @@ const UserDropdown = ({ name, email, handleLogout }: Props) => {
           className="h-10 font-medium gap-3 rounded-full px-3.5 border border-zinc-200/50 dark:border-zinc-800/50 bg-zinc-50/50 dark:bg-zinc-900/50 transition-all hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:border-zinc-300 dark:hover:border-zinc-700 active:scale-[0.98]"
         >
           <div className="size-7 rounded-full bg-linear-to-br from-primary to-primary/60 flex items-center justify-center text-[11px] text-primary-foreground font-bold shadow-md ring-2 ring-primary/20">
-            {name.charAt(0).toUpperCase()}
+            {(name || email || "U").charAt(0).toUpperCase()}
           </div>
           <span className="truncate max-w-30 text-zinc-900 dark:text-zinc-100 font-semibold">
-            {name}
+            {name || email || "User"}
           </span>
           <ChevronDown
             size={14}
