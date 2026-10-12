@@ -1,26 +1,31 @@
 import { useGetShowtimes } from "@/hooks/useShowtimes";
-import { Ticket } from "lucide-react";
-import { Link } from "react-router-dom";
-import { motion, AnimatePresence } from "framer-motion";
+import { useNowPlayingMovies } from "@/hooks/useMovies";
+import { useSearchParams } from "react-router-dom";
+import { AnimatePresence } from "framer-motion";
 import { useMemo, useState } from "react";
-import { Badge } from "@/components/ui/badge";
-import { Card, CardContent } from "@/components/ui/card";
 import { format, parseISO } from "date-fns";
 import ErrorState from "@/components/ErrorState";
-import HeroShowtimes from "@/components/HeroShowtimes";
 import TrailerDialog from "@/components/TrailerDialog";
-import ShowtimesCards from "@/components/ShowtimesCards";
-import { Separator } from "@/components/ui/separator";
 import ShowtimeSkeleton from "@/components/skeletons/ShowtimeSkeleton";
-import { useSearchParams } from "react-router-dom";
-import { TMDB_IMAGE_BASE_URL } from "@/api/constants";
+import type { MoviesShowtimes, Showtime } from "@/types/showtimes";
+import { ShowtimesMobileView } from "@/components/showtimes/ShowtimesMobileView";
+import { ShowtimesDesktopView } from "@/components/showtimes/ShowtimesDesktopView";
 
 const Showtimes = () => {
+  // 1. Fast Query: Fetch active movies list
+  const {
+    data: nowPlayingPages,
+    isLoading: isMoviesLoading,
+    isError: isMoviesError,
+    refetch: refetchMovies,
+  } = useNowPlayingMovies(50);
+
+  // 2. Heavy Query: Fetch full showtimes list in the background
   const {
     data: moviesWithShowtimes,
-    isLoading,
-    isError,
-    refetch,
+    isLoading: isShowtimesLoading,
+    isError: isShowtimesError,
+    refetch: refetchShowtimes,
   } = useGetShowtimes();
 
   const [searchParams, setSearchParams] = useSearchParams();
@@ -35,14 +40,72 @@ const Showtimes = () => {
     });
   };
 
-  const selectedMovie =
-    moviesWithShowtimes?.find(
-      (m) => String(m.movieId) === String(selectedMovieId),
-    ) || moviesWithShowtimes?.[0];
+  // Base list of movies from the fast query
+  const baseMovies = useMemo(() => {
+    return nowPlayingPages?.pages.flatMap((p) => p.items) ?? [];
+  }, [nowPlayingPages]);
 
+  // Lookup map for showtimes when they arrive
+  const showtimesByMovieId = useMemo(() => {
+    const map = new Map<string, Showtime[]>();
+    if (moviesWithShowtimes) {
+      for (const m of moviesWithShowtimes) {
+        map.set(String(m.movieId), m.showtimes || []);
+      }
+    }
+    return map;
+  }, [moviesWithShowtimes]);
+
+  // Unified list of movies: shows immediately from baseMovies, enriched with showtimes
+  const moviesList = useMemo<MoviesShowtimes[]>(() => {
+    if (moviesWithShowtimes && moviesWithShowtimes.length > 0) {
+      return moviesWithShowtimes.map((m) => ({
+        movieId: String(m.movieId),
+        title: m.title,
+        posterPath: m.posterPath || "",
+        trailerKey: m.trailerKey || "",
+        rate: m.rate,
+        runtime: m.runtime,
+        genres: m.genres,
+        showtimes: m.showtimes || [],
+      }));
+    }
+
+    return baseMovies.map((m) => ({
+      movieId: String(m.id),
+      title: m.title,
+      posterPath: m.posterPath || "",
+      trailerKey: "",
+      rate: m.voteAverage,
+      runtime: m.runtime,
+      genres: m.genres,
+      showtimes: showtimesByMovieId.get(String(m.id)) || [],
+    }));
+  }, [baseMovies, moviesWithShowtimes, showtimesByMovieId]);
+
+  // Currently selected movie for Desktop Hero and Sessions views
+  const selectedMovie = useMemo(() => {
+    if (moviesList.length === 0) return null;
+    return (
+      moviesList.find((m) => String(m.movieId) === String(selectedMovieId)) ||
+      moviesList[0]
+    );
+  }, [moviesList, selectedMovieId]);
+
+  // Showtimes for currently selected movie (Desktop)
+  const selectedMovieShowtimes = useMemo(() => {
+    if (!selectedMovie) return [];
+    return (
+      showtimesByMovieId.get(String(selectedMovie.movieId)) ??
+      selectedMovie.showtimes ??
+      []
+    );
+  }, [selectedMovie, showtimesByMovieId]);
+
+  // Group showtimes by day for selected movie (Desktop)
   const groupedShowtimes = useMemo(() => {
-    if (!selectedMovie?.showtimes) return {};
-    return selectedMovie.showtimes.reduce(
+    if (!selectedMovieShowtimes || selectedMovieShowtimes.length === 0) return {};
+    return selectedMovieShowtimes.reduce(
       (acc, showtime) => {
         const date = format(parseISO(showtime.startTime), "yyyy-MM-dd");
         if (!acc[date]) {
@@ -51,167 +114,61 @@ const Showtimes = () => {
         acc[date].push(showtime);
         return acc;
       },
-      {} as Record<string, typeof selectedMovie.showtimes>,
+      {} as Record<string, Showtime[]>
     );
-  }, [selectedMovie]);
+  }, [selectedMovieShowtimes]);
 
   const hallNames = useMemo(
     () => [
       ...new Set(
-        selectedMovie?.showtimes.map((showtime) => showtime.hallName) ?? [],
+        selectedMovieShowtimes.map((showtime) => showtime.hallName) ?? []
       ),
     ],
-    [selectedMovie],
+    [selectedMovieShowtimes]
   );
 
-  if (isLoading) return <ShowtimeSkeleton />;
+  // If both fast and heavy queries are loading and we have no movies at all yet
+  if (isMoviesLoading && moviesList.length === 0) {
+    return <ShowtimeSkeleton />;
+  }
 
-  if (isError || !moviesWithShowtimes) return <ErrorState refetch={refetch} />;
+  // If fast movies query completely failed and we have no movies at all
+  if (isMoviesError && moviesList.length === 0 && !isShowtimesLoading) {
+    return (
+      <ErrorState
+        refetch={() => {
+          refetchMovies();
+          refetchShowtimes();
+        }}
+      />
+    );
+  }
 
   return (
-    <div className="min-h-screen bg-background text-foreground pb-20">
-      {/* Hero Section for Selected Movie */}
-      <AnimatePresence mode="wait">
-        {selectedMovie && (
-          <HeroShowtimes
-            movieId={selectedMovie.movieId}
-            title={selectedMovie.title}
-            posterPath={selectedMovie.posterPath || ""}
-            trailerKey={selectedMovie.trailerKey || ""}
-            setIsVideoVisible={setIsVideoVisible}
-          />
-        )}
-      </AnimatePresence>
+    <>
+      {/* 📱 Mobile Redesigned View (< lg) */}
+      <ShowtimesMobileView
+        moviesList={moviesList}
+        isShowtimesLoading={isShowtimesLoading}
+        isShowtimesError={isShowtimesError}
+        refetchShowtimes={refetchShowtimes}
+      />
 
-      <div className="container mx-auto px-4 -mt-6 relative z-20">
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-          {/* Movie Selection Sidebar */}
-          <div className="lg:col-span-4 space-y-6">
-            <div className="flex items-center justify-between">
-              <h2 className="text-xl font-bold flex items-center gap-2">
-                <Ticket className="w-5 h-5 text-primary" />
-                Select Movie
-              </h2>
-              <span className="text-xs text-muted-foreground uppercase font-semibold">
-                {moviesWithShowtimes.length} Titles
-              </span>
-            </div>
+      {/* 💻 Preserved Desktop View (>= lg) */}
+      <ShowtimesDesktopView
+        selectedMovie={selectedMovie}
+        moviesList={moviesList}
+        selectedMovieId={selectedMovieId}
+        handleMovieSelect={handleMovieSelect}
+        isShowtimesLoading={isShowtimesLoading}
+        isShowtimesError={isShowtimesError}
+        refetchShowtimes={refetchShowtimes}
+        hallNames={hallNames}
+        groupedShowtimes={groupedShowtimes}
+        setIsVideoVisible={setIsVideoVisible}
+      />
 
-            <div className="flex flex-col gap-3 max-h-[70vh] overflow-y-auto pr-3 custom-scrollbar">
-              {moviesWithShowtimes.map((movie) => (
-                <motion.div
-                  key={movie.movieId}
-                  whileHover={{ x: 5 }}
-                  whileTap={{ scale: 0.98 }}
-                >
-                  <Card
-                    className={`cursor-pointer transition-all duration-300 border-none overflow-hidden ${
-                      String(selectedMovieId) === String(movie.movieId) ||
-                      (!selectedMovieId &&
-                        String(moviesWithShowtimes[0]?.movieId) ===
-                          String(movie.movieId))
-                        ? "bg-primary text-primary-foreground shadow-lg shadow-primary/20 ring-1 ring-primary"
-                        : "bg-card hover:bg-accent"
-                    }`}
-                    onClick={() => handleMovieSelect(movie.movieId)}
-                  >
-                    <CardContent className="p-3">
-                      <div className="flex gap-4 items-center">
-                        <div className="w-12 h-18 rounded-md overflow-hidden shrink-0">
-                          <img
-                            src={`${TMDB_IMAGE_BASE_URL}/w200${movie.posterPath}`}
-                            alt={movie.title}
-                            className="w-full h-full object-cover"
-                          />
-                        </div>
-                        <div className="flex flex-col overflow-hidden">
-                          <h3 className="font-bold truncate text-sm">
-                            {movie.title}
-                          </h3>
-                          <p
-                            className={`text-xs ${
-                              String(selectedMovieId) ===
-                                String(movie.movieId) ||
-                              (!selectedMovieId &&
-                                String(moviesWithShowtimes[0]?.movieId) ===
-                                  String(movie.movieId))
-                                ? "text-primary-foreground/80"
-                                : "text-muted-foreground"
-                            }`}
-                          >
-                            {movie.showtimes.length} sessions today
-                          </p>
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-                </motion.div>
-              ))}
-            </div>
-          </div>
-
-          {/* Showtimes Display */}
-          <div className="lg:col-span-8 space-y-8">
-            <div className="bg-card rounded-3xl p-6 md:p-8 border border-white/5 shadow-xl">
-              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
-                <div className="space-y-1">
-                  <h3 className="text-2xl font-bold">Available Sessions</h3>
-                </div>
-                <div className="flex gap-2">
-                  {hallNames.map((hall) => (
-                    <Badge
-                      key={hall}
-                      variant="outline"
-                      className="text-primary border-primary/30 uppercase tracking-[0.2em] px-3 py-1"
-                    >
-                      {hall}
-                    </Badge>
-                  ))}
-                </div>
-              </div>
-
-              <div className="space-y-12">
-                <AnimatePresence mode="popLayout">
-                  {Object.entries(groupedShowtimes).length > 0 ? (
-                    Object.entries(groupedShowtimes).map(
-                      ([date, showtimes]) => (
-                        <div key={date} className="space-y-6">
-                          <div className="flex items-center gap-4">
-                            <h4 className="text-lg font-semibold whitespace-nowrap">
-                              {format(parseISO(date), "EEEE, MMMM do")}
-                            </h4>
-                            <Separator className="flex-1" />
-                          </div>
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            {showtimes.map((showtime, index) => (
-                              <Link
-                                to={`/showtimes/${showtime.id}`}
-                                key={showtime.id}
-                              >
-                                <ShowtimesCards
-                                  key={showtime.id}
-                                  showtime={showtime}
-                                  index={index}
-                                />
-                              </Link>
-                            ))}
-                          </div>
-                        </div>
-                      ),
-                    )
-                  ) : (
-                    <div className="col-span-full py-12 text-center text-muted-foreground border-2 border-dashed rounded-3xl">
-                      No more showtimes available.
-                    </div>
-                  )}
-                </AnimatePresence>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Video Modal */}
+      {/* Video Modal (Shared) */}
       <AnimatePresence>
         {isVideoVisible && selectedMovie?.trailerKey && (
           <TrailerDialog
@@ -220,7 +177,7 @@ const Showtimes = () => {
           />
         )}
       </AnimatePresence>
-    </div>
+    </>
   );
 };
 

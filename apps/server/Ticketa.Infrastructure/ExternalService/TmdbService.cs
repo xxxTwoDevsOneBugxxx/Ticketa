@@ -15,12 +15,18 @@ namespace Ticketa.Infrastructure.ExternalService
     public TmdbService(HttpClient httpClient, IConfiguration configuration, ILogger<TmdbService> logger)
     {
       _httpClient = httpClient;
-      var apiKey = configuration["Tmdb:ApiKey"]
-                  ?? throw new InvalidOperationException("TMDB API key not configured.");
-
-      // Set the TMDB Read Access Token (v4) as a Bearer token
-      _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
       _logger = logger;
+
+      var apiKey = configuration["Tmdb:ApiKey"];
+      if (string.IsNullOrWhiteSpace(apiKey))
+      {
+        _logger.LogWarning("TMDB API key not configured. External TMDB integrations will be unavailable.");
+      }
+      else
+      {
+        // Set the TMDB Read Access Token (v4) as a Bearer token
+        _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+      }
     }
 
     public async Task<IReadOnlyList<TmdbMovieDto>> GetPopularMoviesAsync(CancellationToken ct = default)

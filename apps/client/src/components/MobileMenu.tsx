@@ -61,7 +61,7 @@ const MobileMenu = ({
                 <div className="mb-8 px-2">
                   <div className="flex items-center gap-4 p-4 rounded-2xl bg-muted/30 border border-border/50">
                     <div className="size-12 rounded-full bg-primary/20 flex items-center justify-center text-lg font-bold text-primary">
-                      {name?.charAt(0).toUpperCase()}
+                      {(name || email || "U").charAt(0).toUpperCase()}
                     </div>
                     <div className="flex flex-col overflow-hidden">
                       <span className="font-bold truncate">{name}</span>

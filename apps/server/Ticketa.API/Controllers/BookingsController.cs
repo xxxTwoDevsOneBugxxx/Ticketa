@@ -11,7 +11,7 @@ namespace Ticketa.API.Controllers
   [Authorize]
   public class BookingsController(IBookingService bookingService) : ControllerBase
   {
-    private readonly IBookingService _boookingService = bookingService;
+    private readonly IBookingService _bookingService = bookingService;
 
     [HttpPost]
     public async Task<IActionResult> Book(BookingCreateDto dto, CancellationToken ct)
@@ -19,7 +19,7 @@ namespace Ticketa.API.Controllers
       if (!ModelState.IsValid) return ValidationProblem(ModelState);
 
       var userId = User.FindFirstValue("uid")!;
-      var result = await _boookingService.CreateAsync(dto, userId, ct);
+      var result = await _bookingService.CreateAsync(dto, userId, ct);
 
       if (!result.Succeeded)
         return Conflict(new { message = $"{result.ConflictingSeats.Count} seat(s) already booked.", conflictingSeats = result.ConflictingSeats });
@@ -35,7 +35,7 @@ namespace Ticketa.API.Controllers
     [AllowAnonymous]
     public async Task<IActionResult> GetByReference(string reference, CancellationToken ct)
     {
-      var result = await _boookingService.GetByReferenceAsync(reference, ct);
+      var result = await _bookingService.GetByReferenceAsync(reference, ct);
       return result is null ? NotFound() : Ok(result);
     }
   }

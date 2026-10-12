@@ -43,7 +43,7 @@ const MovieCard = ({ movie, compact }: Props) => {
               exit={{ opacity: 0, scale: 0.8 }}
               className="absolute top-3 left-3"
             >
-              {movie.genres[0] && (
+              {movie.genres?.[0] && (
                 <Badge className="bg-orange-600 hover:bg-orange-700 text-[10px] font-black uppercase tracking-wider px-3 py-1 border-none shadow-xl">
                   {movie.genres[0]}
                 </Badge>
@@ -80,7 +80,7 @@ const MovieCard = ({ movie, compact }: Props) => {
               {movie.title}
             </h3>
             <div className="flex items-center gap-2 text-[8px] font-bold text-gray-300 uppercase tracking-widest">
-              {movie.genres.slice(0, 3).join(" • ")}
+              {movie.genres?.slice(0, 3).join(" • ") ?? ""}
             </div>
           </div>
 

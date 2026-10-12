@@ -93,6 +93,56 @@ namespace Ticketa.Tests.Infrastructure.Services
     }
 
     [Fact]
+    public async Task GetAllAsync_WhenMultipleShowtimesForSameMovieWithDistinctInstances_GroupsUnderSingleMovie()
+    {
+      // Arrange
+      var hall1 = new Hall { Id = 1, Name = "IMAX 1", Type = HallType.IMAX };
+      var hall2 = new Hall { Id = 2, Name = "Standard 1", Type = HallType.Standard };
+
+      // Distinct Movie instances simulating AsNoTracking behavior
+      var movie1 = new Movie { Id = 1, Title = "Avatar", RuntimeMinutes = 160, Genres = [new Genre { Name = "Sci-Fi" }] };
+      var movie2 = new Movie { Id = 1, Title = "Avatar", RuntimeMinutes = 160, Genres = [new Genre { Name = "Sci-Fi" }] };
+
+      var showtime1 = new Showtime
+      {
+        Id = 1,
+        MovieId = 1,
+        HallId = 1,
+        Movie = movie1,
+        Hall = hall1,
+        StartTime = DateTime.UtcNow.AddHours(2),
+        EndTime = DateTime.UtcNow.AddHours(4),
+        Price = 150m,
+        Status = ShowtimeStatus.Scheduled
+      };
+
+      var showtime2 = new Showtime
+      {
+        Id = 2,
+        MovieId = 1,
+        HallId = 2,
+        Movie = movie2,
+        Hall = hall2,
+        StartTime = DateTime.UtcNow.AddHours(5),
+        EndTime = DateTime.UtcNow.AddHours(7),
+        Price = 100m,
+        Status = ShowtimeStatus.Scheduled
+      };
+
+      _mockShowtimeRepo
+          .Setup(r => r.GetAllWithSpecAsync(It.IsAny<ShowtimeSpecification>(), It.IsAny<CancellationToken>()))
+          .ReturnsAsync([showtime1, showtime2]);
+
+      // Act
+      var result = (await _sut.GetAllAsync("Avatar", "scheduled")).ToList();
+
+      // Assert
+      Assert.Single(result);
+      Assert.Equal("Avatar", result[0].Title);
+      Assert.Equal(2, result[0].Showtimes.Count);
+    }
+
+    [Fact]
     public async Task GetHallsAsync_ReturnsMappedHalls()
     {
       // Arrange
@@ -197,6 +247,8 @@ namespace Ticketa.Tests.Infrastructure.Services
       };
 
       var movie = new Movie { Id = DefaultMovieId, Title = "Inception", RuntimeMinutes = 120 };
+      var hall = new Hall { Id = DefaultHallId, Name = "IMAX Hall", Type = HallType.IMAX };
+
       _mockMovieRepo
           .Setup(r => r.GetAsync(It.IsAny<Expression<Func<Movie, bool>>>()))
           .ReturnsAsync(movie);

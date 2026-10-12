@@ -7,8 +7,16 @@ namespace Ticketa.Infrastructure.Specification
   {
     public static IQueryable<T> GetQuery(IQueryable<T> query, BaseSpecification<T> spec)
     {
-      if (spec.Criteria is not null)
-        query = query.Where(spec.Criteria);
+      if (spec.AsNoTracking)
+        query = query.AsNoTracking();
+
+      if (spec.AsSplitQuery)
+        query = query.AsSplitQuery();
+
+      foreach (var criteria in spec.CriteriaList)
+      {
+        query = query.Where(criteria);
+      }
 
       query = spec.Includes.Aggregate(query, (current, include) => current.Include(include));
       query = spec.IncludeStrings.Aggregate(query, (current, include) => current.Include(include));

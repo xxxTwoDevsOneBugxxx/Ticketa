@@ -1,4 +1,4 @@
-﻿using MailKit.Net.Smtp;
+using MailKit.Net.Smtp;
 using MailKit.Security;
 using MimeKit;
 using Ticketa.Core.Interfaces.IServices;
@@ -17,9 +17,17 @@ namespace Ticketa.Infrastructure.Service
 
     public async Task SendEmailAsync(string toEmail, string subject, string htmlBody)
     {
-      var message = new MimeMessage();
+      if (string.IsNullOrWhiteSpace(_settings.Host) || string.IsNullOrWhiteSpace(_settings.Username))
+      {
+        return;
+      }
 
-      message.From.Add(new MailboxAddress(_settings.FromName, _settings.FromEmail));
+      var fromEmail = string.IsNullOrWhiteSpace(_settings.FromEmail) ? _settings.Username : _settings.FromEmail;
+      var fromName = string.IsNullOrWhiteSpace(_settings.FromName) ? "Ticketa" : _settings.FromName;
+      var port = _settings.Port > 0 ? _settings.Port : 587;
+
+      var message = new MimeMessage();
+      message.From.Add(new MailboxAddress(fromName, fromEmail));
       message.To.Add(MailboxAddress.Parse(toEmail));
       message.Subject = subject;
 
@@ -29,7 +37,8 @@ namespace Ticketa.Infrastructure.Service
       }.ToMessageBody();
 
       using var client = new SmtpClient();
-      await client.ConnectAsync(_settings.Host, _settings.Port, SecureSocketOptions.StartTls);
+      client.Timeout = 10000;
+      await client.ConnectAsync(_settings.Host, port, SecureSocketOptions.StartTls);
       await client.AuthenticateAsync(_settings.Username, _settings.Password);
       await client.SendAsync(message);
       await client.DisconnectAsync(true);
@@ -39,8 +48,17 @@ namespace Ticketa.Infrastructure.Service
         string to, string subject, string htmlBody,
         byte[] imageBytes, string contentId, CancellationToken ct = default)
     {
+      if (string.IsNullOrWhiteSpace(_settings.Host) || string.IsNullOrWhiteSpace(_settings.Username))
+      {
+        return;
+      }
+
+      var fromEmail = string.IsNullOrWhiteSpace(_settings.FromEmail) ? _settings.Username : _settings.FromEmail;
+      var fromName = string.IsNullOrWhiteSpace(_settings.FromName) ? "Ticketa" : _settings.FromName;
+      var port = _settings.Port > 0 ? _settings.Port : 587;
+
       var message = new MimeMessage();
-      message.From.Add(new MailboxAddress(_settings.FromName, _settings.FromEmail));
+      message.From.Add(new MailboxAddress(fromName, fromEmail));
       message.To.Add(MailboxAddress.Parse(to));
       message.Subject = subject;
 
@@ -51,7 +69,8 @@ namespace Ticketa.Infrastructure.Service
       message.Body = builder.ToMessageBody();
 
       using var client = new SmtpClient();
-      await client.ConnectAsync(_settings.Host, _settings.Port, SecureSocketOptions.StartTls, ct);
+      client.Timeout = 10000;
+      await client.ConnectAsync(_settings.Host, port, SecureSocketOptions.StartTls, ct);
       await client.AuthenticateAsync(_settings.Username, _settings.Password, ct);
       await client.SendAsync(message, ct);
       await client.DisconnectAsync(true, ct);
