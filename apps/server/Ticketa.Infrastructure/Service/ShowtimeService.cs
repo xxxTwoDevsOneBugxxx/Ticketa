@@ -65,6 +65,7 @@ namespace Ticketa.Infrastructure.Service
               {
                 Id = s.Id,
                 HallName = s.Hall.Name,
+                HallType = s.Hall.Type,
                 VisibleSeatCount = HallTypeHelper.GetTemplate(s.Hall.Type).VisibleSeatCount,
                 StartTime = _timeConversions.EnsureUtcKind(s.StartTime),
                 EndTime = _timeConversions.EnsureUtcKind(s.EndTime),
@@ -197,6 +198,7 @@ namespace Ticketa.Infrastructure.Service
               {
                 Id = s.Id,
                 HallName = s.Hall.Name,
+                HallType = s.Hall.Type,
                 VisibleSeatCount = HallTypeHelper.GetTemplate(s.Hall.Type).VisibleSeatCount,
                 StartTime = _timeConversions.EnsureUtcKind(s.StartTime),
                 EndTime = _timeConversions.EnsureUtcKind(s.EndTime),

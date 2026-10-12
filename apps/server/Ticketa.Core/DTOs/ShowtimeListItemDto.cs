@@ -12,6 +12,7 @@ namespace Ticketa.Core.DTOs
     public ShowtimeStatus Status { get; set; } = ShowtimeStatus.Scheduled;
     public int HallId { get; set; }
     public int VisibleSeatCount { get; set; }
+    public HallType HallType { get; set; } = HallType.Standard;
     public bool IsArchived { get; set; }
     public DateTime? ArchivedAt { get; set; }
   }
