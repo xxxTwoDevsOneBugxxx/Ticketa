@@ -1,18 +1,49 @@
-export type MoviesShowtimes = {
-  id: string;
-	movieId: string;
-	title: string;
-	posterPath?: string;
-	trailerKey?: string;
-	showtimes: Showtime[];
+export type HallFormat = "IMAX" | "Gold" | "Standard";
+
+export function getHallFormat(hallName?: string, hallType?: string | number): HallFormat {
+  if (hallType !== undefined && hallType !== null) {
+    if (typeof hallType === "number") {
+      if (hallType === 1) return "IMAX";
+      if (hallType === 2) return "Gold";
+      return "Standard";
+    }
+    const normType = String(hallType).toLowerCase().trim();
+    if (normType.includes("imax")) return "IMAX";
+    if (normType.includes("gold") || normType.includes("vip")) return "Gold";
+    return "Standard";
+  }
+
+  if (hallName) {
+    const norm = hallName.toLowerCase().trim();
+    if (norm.includes("imax")) return "IMAX";
+    if (norm.includes("gold") || norm.includes("vip")) return "Gold";
+  }
+
+  return "Standard";
 }
 
+export type MoviesShowtimes = {
+  id?: string;
+  movieId: string | number;
+  tmdbId?: number;
+  title: string;
+  posterPath?: string;
+  trailerKey?: string;
+  rate?: number;
+  runtime?: number;
+  genres?: string[];
+  showtimes: Showtime[];
+};
+
 export type Showtime = {
-	id: string;
-	hallName: string;
-	startTime: string;
-	price: number;
-}
+  id: string | number;
+  hallName: string;
+  hallType?: string | number;
+  hallId?: number;
+  startTime: string;
+  endTime?: string;
+  price: number;
+};
 
 export type BookedSeat = {
 	row: number;
