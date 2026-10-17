@@ -29,4 +29,8 @@
     <ProjectReference Include="..\Ticketa.Core\Ticketa.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="Diagnostics\EfConnectionTimingInterceptor.cs" />
+  </ItemGroup>
+
 </Project>

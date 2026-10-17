@@ -30,6 +30,7 @@ namespace Ticketa.Core.Specifications
     public MovieSpecification(int id, bool includeGenres, bool includeCast = false) : this()
     {
       AddCriteria(m => m.Id == id);
+      ApplyNoTracking();
       if (includeGenres)
         AddInclude(m => m.Genres);
       if (includeCast)
@@ -43,6 +44,7 @@ namespace Ticketa.Core.Specifications
       else
         ApplyOrdering(orderColumn, orderDir);
       ApplyPaging(skip, take);
+      ApplyNoTracking();
     }
 
     public MovieSpecification(MovieStatus? status, string? search, bool includeGenres, bool includeCast, int skip, int take, bool? archivedOnly = false)
@@ -50,10 +52,12 @@ namespace Ticketa.Core.Specifications
     {
       AddOrderByDesc(m => m.ReleaseDate);
       ApplyPaging(skip, take);
+      ApplyNoTracking();
     }
 
     private void ApplyFilters(MovieStatus? status, string? search)
     {
+      ApplyNoTracking();
       if (status.HasValue && !string.IsNullOrEmpty(search))
         AddCriteria(m => m.Status == status.Value && m.Title.Contains(search));
       else if (status.HasValue)

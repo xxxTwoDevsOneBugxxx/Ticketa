@@ -18,6 +18,7 @@ namespace Ticketa.Infrastructure.Repositories
     public async Task<List<TopBookedMovieDto>> GetTopBookedMoviesAsync(int count, CancellationToken ct = default)
     {
       var topMovies = await _context.BookedSeats
+           .AsNoTracking()
            .Where(bs => !bs.Showtime.Movie.IsArchived)
            .GroupBy(bs => new
            {
@@ -49,6 +50,7 @@ namespace Ticketa.Infrastructure.Repositories
       var movieIds = topMovies.Select(m => m.Id).ToList();
 
       var genresByMovie = await _context.Movies
+          .AsNoTracking()
           .Where(m => movieIds.Contains(m.Id))
           .Select(m => new { m.Id, GenreNames = m.Genres.Select(g => g.Name).ToList() })
           .ToDictionaryAsync(x => x.Id, x => x.GenreNames, ct);

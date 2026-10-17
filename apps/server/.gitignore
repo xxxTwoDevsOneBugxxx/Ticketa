@@ -369,3 +369,8 @@ FodyWeavers.xsd
 
 coveragereport/
 run-coverage.bat
+
+# k6 performance test users
+test-users.json
+**/test-users.json
+test-results/

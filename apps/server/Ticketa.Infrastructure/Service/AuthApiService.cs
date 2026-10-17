@@ -5,14 +5,23 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Options;
 using System.Security.Claims;
 using System.Text;
+using Microsoft.EntityFrameworkCore;
 using Ticketa.Core.DTOs;
 using Ticketa.Core.Entities;
 using Ticketa.Core.Interfaces.IServices;
 using Ticketa.Core.Settings;
+using Ticketa.Infrastructure.Data;
 
 namespace Ticketa.Infrastructure.Service
 {
-  public class AuthApiService(IEmailService emailService, ITokenService tokenService, UserManager<AppUser> userManager, RoleManager<AppRole> roleManager, IOptions<JwtSettings> jwtSettings, IConfiguration config) : IAuthApiService
+  public class AuthApiService(
+      IEmailService emailService,
+      ITokenService tokenService,
+      UserManager<AppUser> userManager,
+      RoleManager<AppRole> roleManager,
+      IOptions<JwtSettings> jwtSettings,
+      IConfiguration config,
+      ApplicationDbContext? context = null) : IAuthApiService
   {
     private readonly IEmailService _emailService = emailService;
     private readonly ITokenService _tokenService = tokenService;
@@ -20,6 +29,7 @@ namespace Ticketa.Infrastructure.Service
     private readonly RoleManager<AppRole> _roleManager = roleManager;
     private readonly JwtSettings _jwtSettings = jwtSettings.Value;
     private readonly IConfiguration _config = config;
+    private readonly ApplicationDbContext? _context = context;
 
     public async Task<AuthResultDto> ConfirmEmailAsync(ConfirmEmailDto dto, CancellationToken ct = default)
     {
@@ -267,15 +277,38 @@ namespace Ticketa.Infrastructure.Service
 
     private async Task<(string AccessToken, string RefreshToken, DateTime RefreshTokenExpiry)> BuildTokensAsync(AppUser user)
     {
-      var roles = await _userManager.GetRolesAsync(user);
-      var permissions = new List<string>();
+      List<string> roles;
+      List<string> permissions;
 
-      foreach (var roleName in roles)
+      if (_context is not null)
       {
-        var appRole = await _roleManager.FindByNameAsync(roleName);
-        if (appRole is null) continue;
-        var claims = await _roleManager.GetClaimsAsync(appRole);
-        permissions.AddRange(claims.Where(c => c.Type == "permission").Select(c => c.Value));
+        roles = await (
+            from ur in _context.UserRoles.AsNoTracking()
+            where ur.UserId == user.Id
+            join r in _context.Roles.AsNoTracking() on ur.RoleId equals r.Id
+            select r.Name!
+        ).ToListAsync();
+
+        permissions = await (
+            from ur in _context.UserRoles.AsNoTracking()
+            where ur.UserId == user.Id
+            join rc in _context.RoleClaims.AsNoTracking() on ur.RoleId equals rc.RoleId
+            where rc.ClaimType == "permission" && rc.ClaimValue != null
+            select rc.ClaimValue!
+        ).Distinct().ToListAsync();
+      }
+      else
+      {
+        roles = (await _userManager.GetRolesAsync(user)).ToList();
+        permissions = new List<string>();
+
+        foreach (var roleName in roles)
+        {
+          var appRole = await _roleManager.FindByNameAsync(roleName);
+          if (appRole is null) continue;
+          var claims = await _roleManager.GetClaimsAsync(appRole);
+          permissions.AddRange(claims.Where(c => c.Type == "permission").Select(c => c.Value));
+        }
       }
 
       var accessToken = _tokenService.GenerateAccessToken(user, roles, permissions.Distinct().ToList());
@@ -284,7 +317,19 @@ namespace Ticketa.Infrastructure.Service
       var refreshTokenExpiry = DateTime.UtcNow.AddDays(_jwtSettings.RefreshTokenExpiryDate);
       user.RefreshToken = refreshToken;
       user.RefreshTokenExpiry = refreshTokenExpiry;
-      await _userManager.UpdateAsync(user);
+
+      if (_context is not null)
+      {
+        await _context.Users
+            .Where(u => u.Id == user.Id)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(u => u.RefreshToken, refreshToken)
+                .SetProperty(u => u.RefreshTokenExpiry, refreshTokenExpiry));
+      }
+      else
+      {
+        await _userManager.UpdateAsync(user);
+      }
 
       return (accessToken, refreshToken, refreshTokenExpiry);
     }
